@@ -1,0 +1,252 @@
+from flask import Flask, request, jsonify
+from flask_sqlalchemy import SQLAlchemy
+from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
+from flask_socketio import SocketIO
+from dotenv import load_dotenv
+import os, uuid, bcrypt
+from datetime import datetime
+
+load_dotenv()
+
+app = Flask(__name__)
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL')
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY')
+
+db = SQLAlchemy(app)
+jwt = JWTManager(app)
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+# ── Models ──────────────────────────────────────────────
+class User(db.Model):
+    __tablename__ = 'users'
+    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    name = db.Column(db.String(100), nullable=False)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    phone = db.Column(db.String(20), nullable=False)
+    password_hash = db.Column(db.String(255), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class Device(db.Model):
+    __tablename__ = 'devices'
+    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = db.Column(db.String(36), db.ForeignKey('users.id'), nullable=False)
+    device_name = db.Column(db.String(100), nullable=False)
+    beacon_id = db.Column(db.String(64), unique=True, nullable=False)
+    gsm_number = db.Column(db.String(20))
+    status = db.Column(db.String(10), default='SAFE')
+    registered_at = db.Column(db.DateTime, default=datetime.utcnow)
+    stolen_at = db.Column(db.DateTime)
+
+class Sighting(db.Model):
+    __tablename__ = 'sightings'
+    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    device_id = db.Column(db.String(36), db.ForeignKey('devices.id'), nullable=False)
+    latitude = db.Column(db.Float, nullable=False)
+    longitude = db.Column(db.Float, nullable=False)
+    accuracy = db.Column(db.Float)
+    method = db.Column(db.String(10))
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+
+class Command(db.Model):
+    __tablename__ = 'commands'
+    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    device_id = db.Column(db.String(36), db.ForeignKey('devices.id'), nullable=False)
+    command_type = db.Column(db.String(20), nullable=False)
+    status = db.Column(db.String(10), default='PENDING')
+    issued_at = db.Column(db.DateTime, default=datetime.utcnow)
+    executed_at = db.Column(db.DateTime)
+
+class EvidencePhoto(db.Model):
+    __tablename__ = 'evidence_photos'
+    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    device_id = db.Column(db.String(36), db.ForeignKey('devices.id'), nullable=False)
+    file_path = db.Column(db.String(255), nullable=False)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+
+class EvidenceKeylog(db.Model):
+    __tablename__ = 'evidence_keylog'
+    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    device_id = db.Column(db.String(36), db.ForeignKey('devices.id'), nullable=False)
+    keylog_text = db.Column(db.Text)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+
+# ── Auth Routes ─────────────────────────────────────────
+@app.route('/api/auth/register', methods=['POST'])
+def register():
+    data = request.get_json()
+    if not data or not all(k in data for k in ['name','email','phone','password']):
+        return jsonify({'error': 'Missing required fields'}), 400
+    if User.query.filter_by(email=data['email']).first():
+        return jsonify({'error': 'Email already registered'}), 409
+    password_hash = bcrypt.hashpw(data['password'].encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+    user = User(name=data['name'], email=data['email'], phone=data['phone'], password_hash=password_hash)
+    db.session.add(user)
+    db.session.commit()
+    token = create_access_token(identity=user.id)
+    return jsonify({'message': 'Account created', 'token': token, 'user': {'id': user.id, 'name': user.name}}), 201
+
+@app.route('/api/auth/login', methods=['POST'])
+def login():
+    data = request.get_json()
+    if not data or not all(k in data for k in ['email','password']):
+        return jsonify({'error': 'Missing email or password'}), 400
+    user = User.query.filter_by(email=data['email']).first()
+    if not user or not bcrypt.checkpw(data['password'].encode('utf-8'), user.password_hash.encode('utf-8')):
+        return jsonify({'error': 'Invalid credentials'}), 401
+    token = create_access_token(identity=user.id)
+    return jsonify({'message': 'Login successful', 'token': token, 'user': {'id': user.id, 'name': user.name}}), 200
+
+@app.route('/api/auth/profile', methods=['GET'])
+@jwt_required()
+def profile():
+    user = User.query.get(get_jwt_identity())
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+    return jsonify({'id': user.id, 'name': user.name, 'email': user.email, 'phone': user.phone}), 200
+
+# ── Device Routes ────────────────────────────────────────
+@app.route('/api/device/register', methods=['POST'])
+@jwt_required()
+def register_device():
+    data = request.get_json()
+    if not data or 'device_name' not in data:
+        return jsonify({'error': 'Device name required'}), 400
+    device = Device(
+        user_id=get_jwt_identity(),
+        device_name=data['device_name'],
+        beacon_id=str(uuid.uuid4()).replace('-',''),
+        gsm_number=data.get('gsm_number','')
+    )
+    db.session.add(device)
+    db.session.commit()
+    return jsonify({'message': 'Device registered', 'device': {'id': device.id, 'beacon_id': device.beacon_id, 'status': device.status}}), 201
+
+@app.route('/api/device/list', methods=['GET'])
+@jwt_required()
+def list_devices():
+    devices = Device.query.filter_by(user_id=get_jwt_identity()).all()
+    return jsonify({'devices': [{'id': d.id, 'device_name': d.device_name, 'status': d.status} for d in devices]}), 200
+
+@app.route('/api/device/<device_id>/mark-stolen', methods=['POST'])
+@jwt_required()
+def mark_stolen(device_id):
+    device = Device.query.filter_by(id=device_id, user_id=get_jwt_identity()).first()
+    if not device:
+        return jsonify({'error': 'Device not found'}), 404
+    device.status = 'STOLEN'
+    device.stolen_at = datetime.utcnow()
+    db.session.commit()
+    return jsonify({'message': 'Device marked stolen', 'status': 'STOLEN'}), 200
+
+@app.route('/api/device/<device_id>/mark-found', methods=['POST'])
+@jwt_required()
+def mark_found(device_id):
+    device = Device.query.filter_by(id=device_id, user_id=get_jwt_identity()).first()
+    if not device:
+        return jsonify({'error': 'Device not found'}), 404
+    device.status = 'SAFE'
+    db.session.commit()
+    return jsonify({'message': 'Device marked safe', 'status': 'SAFE'}), 200
+
+# ── Sighting Routes ──────────────────────────────────────
+@app.route('/api/sighting/bluetooth', methods=['POST'])
+def bluetooth_sighting():
+    data = request.get_json()
+    if not data or not all(k in data for k in ['beacon_id','latitude','longitude']):
+        return jsonify({'error': 'Missing fields'}), 400
+    device = Device.query.filter_by(beacon_id=data['beacon_id']).first()
+    if not device or device.status != 'STOLEN':
+        return jsonify({'status': 'safe'}), 200
+    sighting = Sighting(device_id=device.id, latitude=data['latitude'], longitude=data['longitude'], method='BLE')
+    db.session.add(sighting)
+    db.session.commit()
+    socketio.emit(f'sighting_{device.id}', {'latitude': data['latitude'], 'longitude': data['longitude'], 'method': 'BLE'})
+    return jsonify({'status': 'reported'}), 200
+
+@app.route('/api/sighting/gsm', methods=['POST'])
+def gsm_sighting():
+    data = request.get_json()
+    if not data or not all(k in data for k in ['device_id','latitude','longitude']):
+        return jsonify({'error': 'Missing fields'}), 400
+    sighting = Sighting(device_id=data['device_id'], latitude=data['latitude'], longitude=data['longitude'], method='GSM')
+    db.session.add(sighting)
+    db.session.commit()
+    socketio.emit(f'sighting_{data["device_id"]}', {'latitude': data['latitude'], 'longitude': data['longitude'], 'method': 'GSM'})
+    return jsonify({'status': 'reported'}), 200
+
+@app.route('/api/sighting/trail/<device_id>', methods=['GET'])
+@jwt_required()
+def get_trail(device_id):
+    sightings = Sighting.query.filter_by(device_id=device_id).order_by(Sighting.timestamp.asc()).all()
+    return jsonify({'trail': [{'latitude': s.latitude, 'longitude': s.longitude, 'method': s.method, 'timestamp': s.timestamp.isoformat()} for s in sightings]}), 200
+
+# ── Command Routes ───────────────────────────────────────
+@app.route('/api/command/send', methods=['POST'])
+@jwt_required()
+def send_command():
+    data = request.get_json()
+    if not data or not all(k in data for k in ['device_id','command_type']):
+        return jsonify({'error': 'Missing fields'}), 400
+    if data['command_type'] not in ['LOCK','PHOTO','ALARM','AUDIO','WIPE','PING']:
+        return jsonify({'error': 'Invalid command'}), 400
+    command = Command(device_id=data['device_id'], command_type=data['command_type'])
+    db.session.add(command)
+    db.session.commit()
+    return jsonify({'message': 'Command queued', 'command_id': command.id}), 201
+
+@app.route('/api/command/pending/<device_id>', methods=['GET'])
+def get_pending(device_id):
+    commands = Command.query.filter_by(device_id=device_id, status='PENDING').all()
+    return jsonify({'commands': [{'id': c.id, 'command_type': c.command_type} for c in commands]}), 200
+
+@app.route('/api/command/acknowledge/<command_id>', methods=['POST'])
+def acknowledge(command_id):
+    command = Command.query.get(command_id)
+    if not command:
+        return jsonify({'error': 'Command not found'}), 404
+    command.status = 'DONE'
+    command.executed_at = datetime.utcnow()
+    db.session.commit()
+    return jsonify({'message': 'Acknowledged'}), 200
+
+# ── Evidence Routes ──────────────────────────────────────
+VAULT = os.path.join(os.path.dirname(__file__), 'evidence_vault')
+os.makedirs(VAULT, exist_ok=True)
+
+@app.route('/api/evidence/photo', methods=['POST'])
+def upload_photo():
+    device_id = request.form.get('device_id')
+    if not device_id or 'photo' not in request.files:
+        return jsonify({'error': 'Missing device_id or photo'}), 400
+    file = request.files['photo']
+    filename = f"{device_id}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.jpg"
+    filepath = os.path.join(VAULT, filename)
+    file.save(filepath)
+    photo = EvidencePhoto(device_id=device_id, file_path=filepath)
+    db.session.add(photo)
+    db.session.commit()
+    return jsonify({'message': 'Photo saved', 'id': photo.id}), 201
+
+@app.route('/api/evidence/keylog', methods=['POST'])
+def upload_keylog():
+    data = request.get_json()
+    if not data or not all(k in data for k in ['device_id','keylog_text']):
+        return jsonify({'error': 'Missing fields'}), 400
+    keylog = EvidenceKeylog(device_id=data['device_id'], keylog_text=data['keylog_text'])
+    db.session.add(keylog)
+    db.session.commit()
+    return jsonify({'message': 'Keylog saved'}), 201
+
+@app.route('/api/evidence/photos/<device_id>', methods=['GET'])
+@jwt_required()
+def get_photos(device_id):
+    photos = EvidencePhoto.query.filter_by(device_id=device_id).order_by(EvidencePhoto.timestamp.desc()).all()
+    return jsonify({'photos': [{'id': p.id, 'timestamp': p.timestamp.isoformat()} for p in photos]}), 200
+
+# ── Run ──────────────────────────────────────────────────
+if __name__ == '__main__':
+    with app.app_context():
+        db.create_all()
+        print("Database tables created successfully")
+    socketio.run(app, host='0.0.0.0', port=5000, debug=True)
