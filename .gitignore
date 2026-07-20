@@ -5,3 +5,16 @@ venv/
 node_modules/
 *.log
 build/
+
+# Evidence
+backend/evidence_vault/
+
+# Python
+__pycache__/
+*.pyc
+
+# Backups
+*.save
+
+# Virtual env
+venv/

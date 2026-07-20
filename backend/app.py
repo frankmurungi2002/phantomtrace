@@ -37,6 +37,7 @@ class Device(db.Model):
     status = db.Column(db.String(10), default='SAFE')
     registered_at = db.Column(db.DateTime, default=datetime.utcnow)
     stolen_at = db.Column(db.DateTime)
+    last_seen = db.Column(db.DateTime, default=datetime.utcnow)
 
 class Sighting(db.Model):
     __tablename__ = 'sightings'
@@ -126,7 +127,24 @@ def register_device():
 @jwt_required()
 def list_devices():
     devices = Device.query.filter_by(user_id=get_jwt_identity()).all()
-    return jsonify({'devices': [{'id': d.id, 'device_name': d.device_name, 'status': d.status} for d in devices]}), 200
+
+    result = []
+
+    for d in devices:
+        online = False
+
+        if d.last_seen:
+            online = (datetime.utcnow() - d.last_seen).total_seconds() < 30
+
+        result.append({
+            'id': d.id,
+            'device_name': d.device_name,
+            'status': d.status,
+            'online': online,
+            'last_seen': d.last_seen.isoformat() if d.last_seen else None
+        })
+
+    return jsonify({'devices': result}), 200
 
 @app.route('/api/device/<device_id>/mark-stolen', methods=['POST'])
 @jwt_required()
@@ -181,6 +199,141 @@ def get_trail(device_id):
     sightings = Sighting.query.filter_by(device_id=device_id).order_by(Sighting.timestamp.asc()).all()
     return jsonify({'trail': [{'latitude': s.latitude, 'longitude': s.longitude, 'method': s.method, 'timestamp': s.timestamp.isoformat()} for s in sightings]}), 200
 
+
+@app.route('/api/device/heartbeat', methods=['POST'])
+def heartbeat():
+    data = request.get_json()
+
+    if not data or 'device_id' not in data:
+        return jsonify({'error': 'Missing device_id'}), 400
+
+    device = Device.query.filter_by(id=data['device_id']).first()
+
+    if not device:
+        return jsonify({'error': 'Device not found'}), 404
+
+    device.last_seen = datetime.utcnow()
+    db.session.commit()
+
+    return jsonify({
+        'message': 'Heartbeat received',
+        'timestamp': device.last_seen.isoformat()
+    }), 200
+
+
+@app.route('/api/device/systeminfo', methods=['POST'])
+def device_systeminfo():
+    data = request.get_json()
+
+    sql = """
+    INSERT INTO device_system_info
+    (device_id, hostname, username, os_name, os_version, updated_at)
+    VALUES
+    (:device_id, :hostname, :username, :os_name, :os_version, NOW())
+    ON CONFLICT (device_id)
+    DO UPDATE SET
+        hostname = EXCLUDED.hostname,
+        username = EXCLUDED.username,
+        os_name = EXCLUDED.os_name,
+        os_version = EXCLUDED.os_version,
+        updated_at = NOW()
+    """
+
+    db.session.execute(
+        db.text(sql),
+        {
+            "device_id": data.get("device_id"),
+            "hostname": data.get("hostname"),
+            "username": data.get("user"),
+            "os_name": data.get("os"),
+            "os_version": data.get("version")
+        }
+    )
+
+    db.session.commit()
+
+    return jsonify({"message":"System info saved"}), 200
+
+
+@app.route('/api/device/networkinfo', methods=['POST'])
+def device_networkinfo():
+    data = request.get_json()
+
+    sql = '''
+    INSERT INTO device_network_info
+    (device_id, hostname, ip_address, mac_address, updated_at)
+    VALUES
+    (:device_id, :hostname, :ip_address, :mac_address, NOW())
+    ON CONFLICT (device_id)
+    DO UPDATE SET
+        hostname = EXCLUDED.hostname,
+        ip_address = EXCLUDED.ip_address,
+        mac_address = EXCLUDED.mac_address,
+        updated_at = NOW()
+    '''
+
+    db.session.execute(
+        db.text(sql),
+        data
+    )
+
+    db.session.commit()
+
+    return jsonify({'message':'Network info saved'}), 200
+
+
+@app.route('/api/device/diskinfo', methods=['POST'])
+def device_diskinfo():
+    data = request.get_json()
+
+    sql = '''
+    INSERT INTO device_disk_info
+    (device_id, total_gb, used_gb, free_gb, updated_at)
+    VALUES
+    (:device_id, :total_gb, :used_gb, :free_gb, NOW())
+    ON CONFLICT (device_id)
+    DO UPDATE SET
+        total_gb = EXCLUDED.total_gb,
+        used_gb = EXCLUDED.used_gb,
+        free_gb = EXCLUDED.free_gb,
+        updated_at = NOW()
+    '''
+
+    db.session.execute(db.text(sql), data)
+    db.session.commit()
+
+    return jsonify({'message':'Disk info saved'}), 200
+
+
+@app.route('/api/device/processes', methods=['POST'])
+def device_processes():
+
+    data = request.get_json()
+
+    device_id = data.get('device_id')
+    processes = data.get('processes', [])
+
+    db.session.execute(
+        db.text("DELETE FROM device_processes WHERE device_id=:id"),
+        {"id": device_id}
+    )
+
+    for proc in processes:
+        db.session.execute(
+            db.text(
+                "INSERT INTO device_processes(device_id, process_name) "
+                "VALUES(:device_id,:process_name)"
+            ),
+            {
+                "device_id": device_id,
+                "process_name": proc
+            }
+        )
+
+    db.session.commit()
+
+    return jsonify({"message":"Processes saved"}), 200
+
 # ── Command Routes ───────────────────────────────────────
 @app.route('/api/command/send', methods=['POST'])
 @jwt_required()
@@ -188,7 +341,7 @@ def send_command():
     data = request.get_json()
     if not data or not all(k in data for k in ['device_id','command_type']):
         return jsonify({'error': 'Missing fields'}), 400
-    if data['command_type'] not in ['LOCK','PHOTO','ALARM','AUDIO','WIPE','PING']:
+    if data['command_type'] not in ['LOCK','PHOTO','ALARM','AUDIO','WIPE','PING','SYSTEM_INFO','GET_NETWORK','GET_DISKS','GET_PROCESSES','SCREENSHOT']:
         return jsonify({'error': 'Invalid command'}), 400
     command = Command(device_id=data['device_id'], command_type=data['command_type'])
     db.session.add(command)
@@ -243,6 +396,75 @@ def upload_keylog():
 def get_photos(device_id):
     photos = EvidencePhoto.query.filter_by(device_id=device_id).order_by(EvidencePhoto.timestamp.desc()).all()
     return jsonify({'photos': [{'id': p.id, 'timestamp': p.timestamp.isoformat()} for p in photos]}), 200
+
+
+@app.route('/api/device/overview/<device_id>', methods=['GET'])
+def device_overview(device_id):
+
+    system_info = db.session.execute(
+        db.text("SELECT * FROM device_system_info WHERE device_id=:id"),
+        {"id": device_id}
+    ).mappings().first()
+
+    network_info = db.session.execute(
+        db.text("SELECT * FROM device_network_info WHERE device_id=:id"),
+        {"id": device_id}
+    ).mappings().first()
+
+    disk_info = db.session.execute(
+        db.text("SELECT * FROM device_disk_info WHERE device_id=:id"),
+        {"id": device_id}
+    ).mappings().first()
+
+    process_count = db.session.execute(
+        db.text("SELECT COUNT(*) FROM device_processes WHERE device_id=:id"),
+        {"id": device_id}
+    ).scalar()
+
+    device = Device.query.filter_by(id=device_id).first()
+
+    online = False
+    last_seen = None
+
+    if device:
+        last_seen = device.last_seen.isoformat() if device.last_seen else None
+
+        if device.last_seen:
+            online = (datetime.utcnow() - device.last_seen).total_seconds() < 30
+
+    return jsonify({
+        "online": online,
+        "last_seen": last_seen,
+        "system_info": dict(system_info) if system_info else None,
+        "network_info": dict(network_info) if network_info else None,
+        "disk_info": dict(disk_info) if disk_info else None,
+        
+"process_count": process_count,
+"command_count": db.session.execute(
+    db.text("SELECT COUNT(*) FROM command_history WHERE device_id=:id"),
+    {"id": device_id}
+).scalar()
+
+    }), 200
+
+
+@app.route('/api/command/result', methods=['POST'])
+def command_result():
+
+    data = request.get_json()
+
+    db.session.execute(
+        db.text(
+            "INSERT INTO command_history "
+            "(device_id, command_type, result) "
+            "VALUES(:device_id,:command_type,:result)"
+        ),
+        data
+    )
+
+    db.session.commit()
+
+    return jsonify({"message":"Result saved"}), 200
 
 # ── Run ──────────────────────────────────────────────────
 if __name__ == '__main__':
