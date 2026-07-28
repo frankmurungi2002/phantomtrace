@@ -5,166 +5,206 @@ import socket
 import getpass
 import uuid
 import shutil
+import subprocess
+import os
+import json
 
-DEVICE_ID = "bad8b4b5-1b2c-4de5-a3db-a575eaafac43"
+CONFIG_FILE = os.path.join(os.path.dirname(__file__), 'device.json')
+BASE_URL = "http://127.0.0.1:5000"
+
+def get_or_register_device():
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, 'r') as f:
+            config = json.load(f)
+            print(f"Device ID loaded: {config['device_id']}")
+            return config['device_id']
+
+    device_name = socket.gethostname()
+    response = requests.post(
+        f"{BASE_URL}/api/device/self-register",
+        json={"device_name": device_name}
+    )
+    if response.status_code == 201:
+        device_id = response.json()['device_id']
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump({"device_id": device_id}, f)
+        print(f"Device registered: {device_id}")
+        return device_id
+    else:
+        raise Exception(f"Registration failed: {response.text}")
+
+def send_system_info():
+    info = {
+        "device_id": DEVICE_ID,
+        "hostname": socket.gethostname(),
+        "user": getpass.getuser(),
+        "os": platform.system(),
+        "version": platform.release()
+    }
+    r = requests.post(f"{BASE_URL}/api/device/systeminfo", json=info)
+    print(f"SYSTEM_INFO sent: {r.status_code}")
+
+def send_network_info():
+    hostname = socket.gethostname()
+    ip_address = socket.gethostbyname(hostname)
+    mac = ':'.join([
+        format((uuid.getnode() >> ele) & 0xff, '02x')
+        for ele in range(0, 8*6, 8)
+    ][::-1])
+    r = requests.post(f"{BASE_URL}/api/device/networkinfo", json={
+        "device_id": DEVICE_ID,
+        "hostname": hostname,
+        "ip_address": ip_address,
+        "mac_address": mac
+    })
+    print(f"NETWORK_INFO sent: {r.status_code}")
+
+def send_disk_info():
+    disk = shutil.disk_usage("/")
+    r = requests.post(f"{BASE_URL}/api/device/diskinfo", json={
+        "device_id": DEVICE_ID,
+        "total_gb": round(disk.total / (1024**3), 2),
+        "used_gb": round(disk.used / (1024**3), 2),
+        "free_gb": round(disk.free / (1024**3), 2)
+    })
+    print(f"DISK_INFO sent: {r.status_code}")
+
+def send_process_info():
+    output = subprocess.check_output(["ps", "-eo", "comm"], text=True)
+    processes = [p.strip() for p in output.splitlines()[1:] if p.strip()][:100]
+    r = requests.post(f"{BASE_URL}/api/device/processes", json={
+        "device_id": DEVICE_ID,
+        "processes": processes
+    })
+    print(f"PROCESSES sent: {r.status_code}")
+
+def send_location():
+    try:
+        geo = requests.get("http://ip-api.com/json/", timeout=5).json()
+        r = requests.post(f"{BASE_URL}/api/device/location", json={
+            "device_id": DEVICE_ID,
+            "latitude": geo.get("lat"),
+            "longitude": geo.get("lon"),
+            "city": geo.get("city"),
+            "country": geo.get("country"),
+            "isp": geo.get("isp"),
+            "ip_address": geo.get("query")
+        })
+        print(f"LOCATION sent: {r.status_code} — {geo.get('city')}, {geo.get('country')}")
+    except Exception as e:
+        print(f"location error: {e}")
+
+def lock_device():
+    try:
+        subprocess.run(["loginctl", "lock-session"], check=False)
+        print("DEVICE LOCKED via loginctl")
+    except Exception:
+        try:
+            subprocess.run(["xdg-screensaver", "lock"], check=False)
+            print("DEVICE LOCKED via xdg-screensaver")
+        except Exception as e:
+            print(f"Lock failed: {e}")
+
+def auto_report():
+    print("--- Auto-reporting device info ---")
+    try: send_system_info()
+    except Exception as e: print(f"system_info error: {e}")
+    try: send_network_info()
+    except Exception as e: print(f"network_info error: {e}")
+    try: send_disk_info()
+    except Exception as e: print(f"disk_info error: {e}")
+    try: send_process_info()
+    except Exception as e: print(f"process_info error: {e}")
+    try: send_location()
+    except Exception as e: print(f"location error: {e}")
+    print("--- Auto-report done ---")
+
+DEVICE_ID = get_or_register_device()
+
+auto_report()
+
+AUTO_REPORT_INTERVAL = 60
+last_report_time = time.time()
 
 while True:
     try:
-        hb = requests.post(
-            "http://127.0.0.1:5000/api/device/heartbeat",
-            json={"device_id": DEVICE_ID}
-        )
-
+        hb = requests.post(f"{BASE_URL}/api/device/heartbeat", json={"device_id": DEVICE_ID})
         print("Heartbeat:", hb.status_code)
 
-        response = requests.get(
-            f"http://127.0.0.1:5000/api/command/pending/{DEVICE_ID}"
-        )
+        if time.time() - last_report_time >= AUTO_REPORT_INTERVAL:
+            auto_report()
+            last_report_time = time.time()
+
+        response = requests.get(f"{BASE_URL}/api/command/pending/{DEVICE_ID}")
 
         if response.status_code == 200:
             data = response.json()
-
             if data["commands"]:
-
                 for cmd in data["commands"]:
-
                     print("Received:", cmd["command_type"])
 
                     if cmd["command_type"] == "PING":
                         print("Device Alive")
 
+                    elif cmd["command_type"] == "LOCK":
+                        lock_device()
+
                     elif cmd["command_type"] == "SYSTEM_INFO":
-
-                        info = {
-                            "device_id": DEVICE_ID,
-                            "hostname": socket.gethostname(),
-                            "user": getpass.getuser(),
-                            "os": platform.system(),
-                            "version": platform.release()
-                        }
-
-                        requests.post(
-                            "http://127.0.0.1:5000/api/device/systeminfo",
-                            json=info
-                        )
-
-                        print("SYSTEM_INFO sent")
+                        send_system_info()
 
                     elif cmd["command_type"] == "GET_NETWORK":
-
-                        hostname = socket.gethostname()
-                        ip_address = socket.gethostbyname(hostname)
-
-                        mac = ':'.join([
-                            format((uuid.getnode() >> ele) & 0xff, '02x')
-                            for ele in range(0, 8*6, 8)
-                        ][::-1])
-
-                        network_info = {
-                            "device_id": DEVICE_ID,
-                            "hostname": hostname,
-                            "ip_address": ip_address,
-                            "mac_address": mac
-                        }
-
-                        requests.post(
-                            "http://127.0.0.1:5000/api/device/networkinfo",
-                            json=network_info
-                        )
-
-                        print("NETWORK INFO SENT")
+                        send_network_info()
 
                     elif cmd["command_type"] == "GET_DISKS":
-
-                        disk = shutil.disk_usage("/")
-
-                        disk_info = {
-                            "device_id": DEVICE_ID,
-                            "total_gb": round(disk.total / (1024**3), 2),
-                            "used_gb": round(disk.used / (1024**3), 2),
-                            "free_gb": round(disk.free / (1024**3), 2)
-                        }
-
-                        requests.post(
-                            "http://127.0.0.1:5000/api/device/diskinfo",
-                            json=disk_info
-                        )
-
-                        print("DISK INFO SENT")
-                        print(disk_info)
-
+                        send_disk_info()
 
                     elif cmd["command_type"] == "GET_PROCESSES":
+                        send_process_info()
 
-                        import subprocess
+                    elif cmd["command_type"] == "GET_LOCATION":
+                        send_location()
 
-                        output = subprocess.check_output(
-                            ["ps", "-eo", "comm"],
-                            text=True
-                        )
-
-                        processes = [
-                            p.strip()
-                            for p in output.splitlines()[1:]
-                            if p.strip()
-                        ][:100]
-
-                        requests.post(
-                            "http://127.0.0.1:5000/api/device/processes",
-                            json={
-                                "device_id": DEVICE_ID,
-                                "processes": processes
-                            }
-                        )
-
-                        print("PROCESSES SENT")
-                        print("Count:", len(processes))
+                    elif cmd["command_type"] == "PHOTO":
+                        import cv2
+                        camera = cv2.VideoCapture(0)
+                        time.sleep(1)
+                        ret, frame = camera.read()
+                        camera.release()
+                        if ret:
+                            filename = "/tmp/pt_webcam.jpg"
+                            cv2.imwrite(filename, frame)
+                            with open(filename, "rb") as photo_file:
+                                r = requests.post(
+                                    f"{BASE_URL}/api/evidence/photo",
+                                    files={"photo": photo_file},
+                                    data={"device_id": DEVICE_ID, "photo_type": "WEBCAM"}
+                                )
+                            print("WEBCAM PHOTO SENT:", r.status_code)
+                        else:
+                            print("Webcam not available")
 
                     elif cmd["command_type"] == "SCREENSHOT":
-
-                        import pyautogui
-
-                        filename = "/tmp/screenshot.png"
-
-                        pyautogui.screenshot().save(filename)
-
-                        files = {
-                            "photo": open(filename, "rb")
-                        }
-
-                        data = {
-                            "device_id": DEVICE_ID
-                        }
-
-                        r = requests.post(
-                            "http://127.0.0.1:5000/api/evidence/photo",
-                            files=files,
-                            data=data
-                        )
-
+                        filename = "/tmp/pt_screenshot.jpg"
+                        subprocess.run(["scrot", filename], check=True)
+                        with open(filename, "rb") as screen_file:
+                            r = requests.post(
+                                f"{BASE_URL}/api/evidence/photo",
+                                files={"photo": screen_file},
+                                data={"device_id": DEVICE_ID, "photo_type": "SCREENSHOT"}
+                            )
                         print("SCREENSHOT SENT:", r.status_code)
 
-
+                    requests.post(f"{BASE_URL}/api/command/acknowledge/{cmd['id']}")
                     requests.post(
-                        f"http://127.0.0.1:5000/api/command/acknowledge/{cmd['id']}"
+                        f"{BASE_URL}/api/command/result",
+                        json={"device_id": DEVICE_ID, "command_type": cmd["command_type"], "result": "SUCCESS"}
                     )
-
-                    requests.post(
-                        "http://127.0.0.1:5000/api/command/result",
-                        json={
-                            "device_id": DEVICE_ID,
-                            "command_type": cmd["command_type"],
-                            "result": "SUCCESS"
-                        }
-                    )
-
                     print("Acknowledged:", cmd["id"])
                     print("-" * 40)
-
             else:
                 print("No pending commands")
 
     except Exception as e:
         print("Exception:", e)
 
-    time.sleep(10)
+    time.sleep(3)
