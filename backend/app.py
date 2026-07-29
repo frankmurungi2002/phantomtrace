@@ -7,6 +7,30 @@ import os, uuid, bcrypt
 from datetime import datetime
 from flask import send_file
 load_dotenv()
+import firebase_admin
+from firebase_admin import credentials, messaging
+
+# Initialize Firebase
+_cred_path = os.path.join(os.path.dirname(__file__), 'firebase-service-account.json')
+if os.path.exists(_cred_path):
+    firebase_admin.initialize_app(credentials.Certificate(_cred_path))
+    print("Firebase initialized")
+else:
+    print("WARNING: firebase-service-account.json not found")
+
+def send_push(token, title, body, data=None):
+    try:
+        message = messaging.Message(
+            notification=messaging.Notification(title=title, body=body),
+            data=data or {},
+            token=token,
+        )
+        messaging.send(message)
+        print(f"Push sent: {title}")
+    except Exception as e:
+        print(f"Push failed: {e}")
+
+
 
 app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL')
@@ -85,6 +109,22 @@ class EvidenceKeylog(db.Model):
     device_id = db.Column(db.String(36), db.ForeignKey('devices.id'), nullable=False)
     keylog_text = db.Column(db.Text)
     timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+
+
+@app.route('/api/auth/fcm-token', methods=['POST'])
+@jwt_required()
+def save_fcm_token():
+    user_id = get_jwt_identity()
+    data = request.get_json()
+    token = data.get('token')
+    if not token:
+        return jsonify({"error": "No token"}), 400
+    db.session.execute(
+        db.text("UPDATE users SET fcm_token=:token WHERE id=:id"),
+        {"token": token, "id": user_id}
+    )
+    db.session.commit()
+    return jsonify({"message": "FCM token saved"}), 200
 
 @app.route('/api/auth/register', methods=['POST'])
 def register():
@@ -225,8 +265,11 @@ def heartbeat():
     device = Device.query.filter_by(id=data['device_id']).first()
     if not device:
         return jsonify({'error': 'Device not found'}), 404
+    was_offline = device.last_seen is None or (datetime.utcnow() - device.last_seen).total_seconds() > 30
     device.last_seen = datetime.utcnow()
     db.session.commit()
+    if was_offline:
+        notify_device_owner(device.id, '🟢 Device Online', f'{device.device_name} is now online', {'device_id': device.id})
     return jsonify({'message': 'Heartbeat received', 'timestamp': device.last_seen.isoformat()}), 200
 
 @app.route('/api/device/systeminfo', methods=['POST'])
@@ -315,6 +358,13 @@ def send_command():
     command = Command(device_id=data['device_id'], command_type=data['command_type'])
     db.session.add(command)
     db.session.commit()
+    cmd_type = data['command_type']
+    if cmd_type == 'LOCK':
+        notify_device_owner(data['device_id'], '🔒 Lock Sent', f'Lock command sent to device', {'device_id': data['device_id']})
+    elif cmd_type == 'PHOTO':
+        notify_device_owner(data['device_id'], '📸 Webcam Capture', 'Webcam photo requested', {'device_id': data['device_id']})
+    elif cmd_type == 'SCREENSHOT':
+        notify_device_owner(data['device_id'], '🖥️ Screenshot', 'Screenshot requested', {'device_id': data['device_id']})
     return jsonify({'message': 'Command queued', 'command_id': command.id}), 201
 
 @app.route('/api/command/pending/<device_id>', methods=['GET'])
