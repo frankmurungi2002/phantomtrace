@@ -76,6 +76,7 @@ class DeviceLocation(db.Model):
     country = db.Column(db.String(100))
     isp = db.Column(db.String(200))
     ip_address = db.Column(db.String(50))
+    area = db.Column(db.String(200))
     updated_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 class EvidenceKeylog(db.Model):
@@ -398,15 +399,15 @@ def device_location():
     ).first()
     if existing:
         db.session.execute(
-            db.text("UPDATE device_location SET latitude=:lat, longitude=:lon, city=:city, country=:country, isp=:isp, ip_address=:ip, updated_at=NOW() WHERE device_id=:device_id"),
+            db.text("UPDATE device_location SET latitude=:lat, longitude=:lon, city=:city, country=:country, isp=:isp, ip_address=:ip, area=:area, updated_at=NOW() WHERE device_id=:device_id"),
             {"lat": data.get("latitude"), "lon": data.get("longitude"), "city": data.get("city"),
-             "country": data.get("country"), "isp": data.get("isp"), "ip": data.get("ip_address"), "device_id": device_id}
+             "country": data.get("country"), "isp": data.get("isp"), "ip": data.get("ip_address"), "area": data.get("area", ""), "device_id": device_id}
         )
     else:
         db.session.execute(
-            db.text("INSERT INTO device_location (device_id, latitude, longitude, city, country, isp, ip_address, updated_at) VALUES(:device_id,:lat,:lon,:city,:country,:isp,:ip,NOW())"),
+            db.text("INSERT INTO device_location (device_id, latitude, longitude, city, country, isp, ip_address, area, updated_at) VALUES(:device_id,:lat,:lon,:city,:country,:isp,:ip,:area,NOW())"),
             {"device_id": device_id, "lat": data.get("latitude"), "lon": data.get("longitude"),
-             "city": data.get("city"), "country": data.get("country"), "isp": data.get("isp"), "ip": data.get("ip_address")}
+             "city": data.get("city"), "country": data.get("country"), "isp": data.get("isp"), "ip": data.get("ip_address"), "area": data.get("area", "")}
         )
     db.session.commit()
     return jsonify({"message": "Location saved"}), 200
