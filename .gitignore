@@ -19,3 +19,4 @@ __pycache__/
 # Virtual env
 venv/
 agent/device.json
+backend/firebase-service-account.json

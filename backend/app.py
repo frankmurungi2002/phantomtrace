@@ -111,6 +111,18 @@ class EvidenceKeylog(db.Model):
     timestamp = db.Column(db.DateTime, default=datetime.utcnow)
 
 
+def notify_device_owner(device_id, title, body, data=None):
+    try:
+        result = db.session.execute(
+            db.text("SELECT u.fcm_token FROM users u JOIN devices d ON d.user_id = u.id WHERE d.id=:id"),
+            {"id": device_id}
+        ).first()
+        if result and result[0]:
+            send_push(result[0], title, body, data or {})
+    except Exception as e:
+        print(f"notify error: {e}")
+
+
 @app.route('/api/auth/fcm-token', methods=['POST'])
 @jwt_required()
 def save_fcm_token():
@@ -353,18 +365,12 @@ def send_command():
     data = request.get_json()
     if not data or not all(k in data for k in ['device_id','command_type']):
         return jsonify({'error': 'Missing fields'}), 400
-    if data['command_type'] not in ['LOCK','PHOTO','ALARM','AUDIO','WIPE','PING','SYSTEM_INFO','GET_NETWORK','GET_DISKS','GET_PROCESSES','SCREENSHOT','GET_LOCATION']:
+    if data['command_type'] not in ['LOCK','PHOTO','ALARM','AUDIO','WIPE','PING','SYSTEM_INFO','GET_NETWORK','GET_DISKS','GET_PROCESSES','SCREENSHOT','GET_LOCATION','STOP_ALARM']:
         return jsonify({'error': 'Invalid command'}), 400
     command = Command(device_id=data['device_id'], command_type=data['command_type'])
     db.session.add(command)
     db.session.commit()
     cmd_type = data['command_type']
-    if cmd_type == 'LOCK':
-        notify_device_owner(data['device_id'], '🔒 Lock Sent', f'Lock command sent to device', {'device_id': data['device_id']})
-    elif cmd_type == 'PHOTO':
-        notify_device_owner(data['device_id'], '📸 Webcam Capture', 'Webcam photo requested', {'device_id': data['device_id']})
-    elif cmd_type == 'SCREENSHOT':
-        notify_device_owner(data['device_id'], '🖥️ Screenshot', 'Screenshot requested', {'device_id': data['device_id']})
     return jsonify({'message': 'Command queued', 'command_id': command.id}), 201
 
 @app.route('/api/command/pending/<device_id>', methods=['GET'])
@@ -431,11 +437,20 @@ def get_photos(device_id):
         ]
     }), 200
 
-@app.route('/api/evidence/photo/<photo_id>', methods=['GET'])
+@app.route('/api/evidence/photo/<photo_id>', methods=['GET', 'DELETE'])
 def get_photo(photo_id):
     photo = EvidencePhoto.query.filter_by(id=photo_id).first()
     if not photo:
         return jsonify({'error': 'Photo not found'}), 404
+    if request.method == 'DELETE':
+        import os
+        try:
+            os.remove(photo.file_path)
+        except Exception:
+            pass
+        db.session.delete(photo)
+        db.session.commit()
+        return jsonify({'message': 'Deleted'}), 200
     return send_file(photo.file_path)
 
 

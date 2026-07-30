@@ -10,7 +10,7 @@ import os
 import json
 
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), 'device.json')
-BASE_URL = "http://192.168.1.76:5000"
+BASE_URL = "http://10.31.49.252:5000"
 
 def get_or_register_device():
     if os.path.exists(CONFIG_FILE):
@@ -135,6 +135,39 @@ def lock_device():
         except Exception as e:
             print(f"Lock failed: {e}")
 
+
+_alarm_running = False
+
+def play_alarm():
+    global _alarm_running
+    _alarm_running = True
+    print("ALARM STARTED")
+    # Force volume to max once
+    subprocess.run(["amixer", "-q", "sset", "Master", "100%"], check=False)
+    # Generate a beep tone file
+    subprocess.run([
+        "ffmpeg", "-y", "-f", "lavfi",
+        "-i", "sine=frequency=1000:duration=30",
+        "/tmp/pt_alarm.wav"
+    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    while _alarm_running:
+        try:
+            subprocess.run(["amixer", "-q", "sset", "Master", "100%"], check=False)
+            proc = subprocess.Popen(
+                ["ffplay", "-nodisp", "-autoexit", "/tmp/pt_alarm.wav"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            import time as _t
+            while _alarm_running and proc.poll() is None:
+                subprocess.run(["amixer", "-q", "sset", "Master", "100%"], check=False)
+                _t.sleep(1)
+            proc.terminate()
+        except Exception as e:
+            print(f"Alarm error: {e}")
+            import time as _t
+            _t.sleep(1)
+    print("ALARM STOPPED")
+
 def auto_report():
     print("--- Auto-reporting device info ---")
     try: send_system_info()
@@ -176,6 +209,19 @@ while True:
                     if cmd["command_type"] == "PING":
                         print("Device Alive")
 
+                    elif cmd["command_type"] == "ALARM":
+                        import threading
+                        _alarm_running = True
+                        t = threading.Thread(target=play_alarm, daemon=True)
+                        t.start()
+                        print("ALARM TRIGGERED")
+
+                    elif cmd["command_type"] == "STOP_ALARM":
+                        _alarm_running = False
+                        subprocess.run(["pkill", "-f", "pw-cat"], check=False)
+                        subprocess.run(["pkill", "-f", "pw-play"], check=False)
+                        print("ALARM STOPPED")
+
                     elif cmd["command_type"] == "LOCK":
                         lock_device()
 
@@ -196,11 +242,21 @@ while True:
 
                     elif cmd["command_type"] == "PHOTO":
                         import cv2
-                        camera = cv2.VideoCapture(0)
-                        time.sleep(1)
-                        ret, frame = camera.read()
-                        camera.release()
-                        if ret:
+                        ret, frame = False, None
+                        camera = None
+                        for cam_index in range(4):
+                            try:
+                                camera = cv2.VideoCapture(cam_index)
+                                time.sleep(0.5)
+                                ret, frame = camera.read()
+                                camera.release()
+                                if ret:
+                                    print(f"Webcam found at index {cam_index}")
+                                    break
+                            except Exception:
+                                if camera:
+                                    camera.release()
+                        if ret and frame is not None:
                             filename = "/tmp/pt_webcam.jpg"
                             cv2.imwrite(filename, frame)
                             with open(filename, "rb") as photo_file:
@@ -211,10 +267,11 @@ while True:
                                 )
                             print("WEBCAM PHOTO SENT:", r.status_code)
                         else:
-                            print("Webcam not available")
+                            print("Webcam not available on any index")
 
                     elif cmd["command_type"] == "SCREENSHOT":
-                        filename = "/tmp/pt_screenshot.jpg"
+                        import time as _time
+                        filename = f"/tmp/pt_screenshot_{int(_time.time())}.jpg"
                         subprocess.run(["scrot", filename], check=True)
                         with open(filename, "rb") as screen_file:
                             r = requests.post(
@@ -222,6 +279,7 @@ while True:
                                 files={"photo": screen_file},
                                 data={"device_id": DEVICE_ID, "photo_type": "SCREENSHOT"}
                             )
+                        os.remove(filename)
                         print("SCREENSHOT SENT:", r.status_code)
 
                     requests.post(f"{BASE_URL}/api/command/acknowledge/{cmd['id']}")
