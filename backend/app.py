@@ -103,6 +103,47 @@ class DeviceLocation(db.Model):
     area = db.Column(db.String(200))
     updated_at = db.Column(db.DateTime, default=datetime.utcnow)
 
+class DeviceSystemInfo(db.Model):
+    __tablename__ = 'device_system_info'
+    device_id = db.Column(db.String(36), db.ForeignKey('devices.id'), primary_key=True)
+    hostname = db.Column(db.String(100))
+    username = db.Column(db.String(100))
+    os_name = db.Column(db.String(100))
+    os_version = db.Column(db.String(100))
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class DeviceNetworkInfo(db.Model):
+    __tablename__ = 'device_network_info'
+    device_id = db.Column(db.String(36), db.ForeignKey('devices.id'), primary_key=True)
+    hostname = db.Column(db.String(100))
+    ip_address = db.Column(db.String(50))
+    mac_address = db.Column(db.String(50))
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class DeviceDiskInfo(db.Model):
+    __tablename__ = 'device_disk_info'
+    device_id = db.Column(db.String(36), db.ForeignKey('devices.id'), primary_key=True)
+    total_gb = db.Column(db.String(20))
+    used_gb = db.Column(db.String(20))
+    free_gb = db.Column(db.String(20))
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class DeviceProcess(db.Model):
+    __tablename__ = 'device_processes'
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    device_id = db.Column(db.String(36), db.ForeignKey('devices.id'))
+    process_name = db.Column(db.String(100))
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class CommandHistory(db.Model):
+    __tablename__ = 'command_history'
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    device_id = db.Column(db.String(36), db.ForeignKey('devices.id'))
+    command_type = db.Column(db.String(50))
+    result = db.Column(db.String(50))
+    executed_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+
 class EvidenceKeylog(db.Model):
     __tablename__ = 'evidence_keylog'
     id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
