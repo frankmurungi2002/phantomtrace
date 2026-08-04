@@ -354,6 +354,7 @@ while True:
                         _alarm_running = True
                         t = threading.Thread(target=play_alarm, daemon=True)
                         t.start()
+                        lock_device()
                         print("ALARM TRIGGERED")
 
                     elif cmd["command_type"] == "STOP_ALARM":
