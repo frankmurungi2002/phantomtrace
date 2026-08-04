@@ -3,10 +3,9 @@ import sys
 import platform as _platform_check
 
 def _ensure_dependencies():
-    """Auto-install missing dependencies on first run, cross-platform."""
     required = ["requests", "opencv-python"]
     if _platform_check.system() == "Windows":
-        required += ["pycaw", "comtypes"]
+        required += ["pycaw", "comtypes", "pillow"]
 
     import importlib
     import_names = {
@@ -14,6 +13,7 @@ def _ensure_dependencies():
         "opencv-python": "cv2",
         "pycaw": "pycaw",
         "comtypes": "comtypes",
+        "pillow": "PIL",
     }
 
     missing = []
@@ -30,7 +30,6 @@ def _ensure_dependencies():
             [sys.executable, "-m", "pip", "install", "--quiet"] + missing,
             check=False
         )
-        print("Dependency install complete.")
 
 _ensure_dependencies()
 
@@ -44,7 +43,10 @@ import shutil
 import os
 import json
 
-CONFIG_FILE = os.path.join(os.path.dirname(__file__), 'device.json')
+IS_WINDOWS = platform.system() == "Windows"
+IS_LINUX = platform.system() == "Linux"
+
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'device.json')
 BASE_URL = "https://phantomtrace-backend-c0if.onrender.com"
 
 def get_or_register_device():
@@ -95,7 +97,8 @@ def send_network_info():
     print(f"NETWORK_INFO sent: {r.status_code}")
 
 def send_disk_info():
-    disk = shutil.disk_usage("/")
+    path = "C:\\" if IS_WINDOWS else "/"
+    disk = shutil.disk_usage(path)
     r = requests.post(f"{BASE_URL}/api/device/diskinfo", json={
         "device_id": DEVICE_ID,
         "total_gb": round(disk.total / (1024**3), 2),
@@ -105,21 +108,36 @@ def send_disk_info():
     print(f"DISK_INFO sent: {r.status_code}")
 
 def send_process_info():
-    output = subprocess.check_output(["ps", "-eo", "comm"], text=True)
-    processes = [p.strip() for p in output.splitlines()[1:] if p.strip()][:100]
-    r = requests.post(f"{BASE_URL}/api/device/processes", json={
-        "device_id": DEVICE_ID,
-        "processes": processes
-    })
-    print(f"PROCESSES sent: {r.status_code}")
+    try:
+        if IS_WINDOWS:
+            output = subprocess.check_output(["tasklist", "/FO", "CSV", "/NH"], text=True, errors="ignore")
+            processes = []
+            for line in output.splitlines():
+                if line.strip():
+                    name = line.split('","')[0].strip('"')
+                    if name:
+                        processes.append(name)
+            processes = list(set(processes))[:100]
+        else:
+            output = subprocess.check_output(["ps", "-eo", "comm"], text=True)
+            processes = [p.strip() for p in output.splitlines()[1:] if p.strip()][:100]
+
+        r = requests.post(f"{BASE_URL}/api/device/processes", json={
+            "device_id": DEVICE_ID,
+            "processes": processes
+        })
+        print(f"PROCESSES sent: {r.status_code}")
+    except Exception as e:
+        print(f"process_info error: {e}")
 
 def send_location():
     try:
-        geo = requests.get("http://ip-api.com/json/?fields=lat,lon,city,regionName,country,isp,query,zip,district", timeout=5).json()
+        geo = requests.get(
+            "http://ip-api.com/json/?fields=lat,lon,city,regionName,country,isp,query,zip,district",
+            timeout=5
+        ).json()
         lat = geo.get("lat")
         lon = geo.get("lon")
-
-        # Get suburb/neighbourhood via Nominatim reverse geocoding
         area = geo.get("district") or geo.get("regionName") or ""
         try:
             nom = requests.get(
@@ -128,14 +146,10 @@ def send_location():
                 timeout=5
             ).json()
             addr = nom.get("address", {})
-            # Pick the most specific area name available
             area = (
-                addr.get("suburb") or
-                addr.get("neighbourhood") or
-                addr.get("quarter") or
-                addr.get("city_district") or
-                addr.get("district") or
-                addr.get("county") or
+                addr.get("suburb") or addr.get("neighbourhood") or
+                addr.get("quarter") or addr.get("city_district") or
+                addr.get("district") or addr.get("county") or
                 geo.get("regionName") or ""
             )
         except Exception as ne:
@@ -161,152 +175,57 @@ def send_location():
 
 def lock_device():
     try:
-        subprocess.run(["loginctl", "lock-session"], check=False)
-        print("DEVICE LOCKED via loginctl")
-    except Exception:
-        try:
-            subprocess.run(["xdg-screensaver", "lock"], check=False)
-            print("DEVICE LOCKED via xdg-screensaver")
-        except Exception as e:
-            print(f"Lock failed: {e}")
-
-
-_alarm_running = False
-
-def _set_volume(level):
-    """Cross-platform volume set. level is 0.0-1.0."""
-    system = platform.system()
-    if system == "Linux":
-        _set_volume_linux(level)
-    elif system == "Windows":
-        _set_volume_windows(level)
-    elif system == "Darwin":
-        _set_volume_macos(level)
-
-def _set_volume_linux(level):
-    # Try PipeWire first (works on most normal Linux setups)
-    try:
-        result = subprocess.run(
-            ["su", "francis", "-c",
-             f"XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus wpctl set-volume @DEFAULT_AUDIO_SINK@ {level}"],
-            check=False, capture_output=True, text=True
-        )
-        if result.returncode == 0 and "error" not in (result.stderr or "").lower():
-            return
-    except Exception:
-        pass
-    # Fallback: raw ALSA amixer (covers machines where PipeWire routing is broken)
-    try:
-        pct = int(level * 100)
-        subprocess.run(["amixer", "sset", "Master", f"{pct}%", "unmute"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run(["amixer", "sset", "Speaker", f"{pct}%", "unmute"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if IS_WINDOWS:
+            import ctypes
+            ctypes.windll.user32.LockWorkStation()
+            print("DEVICE LOCKED via LockWorkStation")
+        else:
+            subprocess.run(["loginctl", "lock-session"], check=False)
+            print("DEVICE LOCKED via loginctl")
     except Exception as e:
-        print(f"Linux volume fallback error: {e}")
+        print(f"Lock failed: {e}")
 
-def _set_volume_windows(level):
+def take_screenshot():
     try:
-        from ctypes import cast, POINTER
-        from comtypes import CLSCTX_ALL
-        from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
-        devices = AudioUtilities.GetSpeakers()
-        interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-        volume = cast(interface, POINTER(IAudioEndpointVolume))
-        volume.SetMasterVolumeLevelScalar(level, None)
+        if IS_WINDOWS:
+            from PIL import ImageGrab
+            import tempfile
+            filename = os.path.join(tempfile.gettempdir(), f"pt_screenshot_{int(time.time())}.jpg")
+            img = ImageGrab.grab()
+            img.save(filename, "JPEG")
+        else:
+            filename = f"/tmp/pt_screenshot_{int(time.time())}.jpg"
+            subprocess.run(["scrot", filename], check=True)
+        return filename
     except Exception as e:
-        print(f"Windows volume error (is pycaw installed? pip install pycaw comtypes): {e}")
-
-def _set_volume_macos(level):
-    try:
-        pct = int(level * 100)
-        subprocess.run(["osascript", "-e", f"set volume output volume {pct}"], check=False)
-    except Exception as e:
-        print(f"macOS volume error: {e}")
-
-def _play_sound_linux(path):
-    try:
-        proc = subprocess.Popen(["ffplay", "-nodisp", "-autoexit", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return proc
-    except Exception:
-        try:
-            proc = subprocess.Popen(["aplay", "-D", "plughw:0,0", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return proc
-        except Exception as e:
-            print(f"Linux playback error: {e}")
-            return None
-
-def _play_sound_windows(path):
-    try:
-        import winsound
-        winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_LOOP)
-        return "winsound"
-    except Exception as e:
-        print(f"Windows playback error: {e}")
+        print(f"Screenshot error: {e}")
         return None
 
-def _play_sound_macos(path):
+def take_photo():
     try:
-        proc = subprocess.Popen(["afplay", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return proc
-    except Exception as e:
-        print(f"macOS playback error: {e}")
+        import cv2
+        if IS_WINDOWS:
+            tmp = os.path.join(os.environ.get("TEMP", "."), "pt_webcam.jpg")
+        else:
+            tmp = "/tmp/pt_webcam.jpg"
+
+        for cam_index in range(4):
+            try:
+                camera = cv2.VideoCapture(cam_index)
+                time.sleep(0.5)
+                ret, frame = camera.read()
+                camera.release()
+                if ret:
+                    cv2.imwrite(tmp, frame)
+                    print(f"Webcam captured at index {cam_index}")
+                    return tmp
+            except Exception:
+                pass
+        print("No webcam found")
         return None
-
-def play_alarm():
-    global _alarm_running
-    _alarm_running = True
-    system = platform.system()
-    print(f"ALARM STARTED (OS: {system})")
-    import time as _t
-
-    if system == "Windows":
-        alarm_file = os.path.join(os.environ.get("TEMP", "."), "pt_alarm.wav")
-    else:
-        alarm_file = "/tmp/pt_alarm.wav"
-
-    try:
-        subprocess.run([
-            "ffmpeg", "-y", "-f", "lavfi",
-            "-i", "sine=frequency=1000:duration=30",
-            alarm_file
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
     except Exception as e:
-        print(f"ffmpeg not available, alarm may be silent: {e}")
-
-    # Gradual ramp from 10% to 100% over ~5 seconds
-    for step in [0.10, 0.25, 0.40, 0.55, 0.70, 0.85, 1.0]:
-        _set_volume(step)
-        _t.sleep(0.7)
-
-    while _alarm_running:
-        try:
-            _set_volume(1.0)
-            if system == "Linux":
-                proc = _play_sound_linux(alarm_file)
-            elif system == "Windows":
-                proc = _play_sound_windows(alarm_file)
-            elif system == "Darwin":
-                proc = _play_sound_macos(alarm_file)
-            else:
-                proc = None
-
-            if proc == "winsound":
-                while _alarm_running:
-                    _set_volume(1.0)
-                    _t.sleep(1)
-                import winsound
-                winsound.PlaySound(None, winsound.SND_PURGE)
-            elif proc is not None:
-                while _alarm_running and proc.poll() is None:
-                    _set_volume(1.0)
-                    _t.sleep(1)
-                proc.terminate()
-            else:
-                print("No playback method available on this OS")
-                _t.sleep(2)
-        except Exception as e:
-            print(f"Alarm error: {e}")
-            _t.sleep(1)
-    print("ALARM STOPPED")
+        print(f"Photo error: {e}")
+        return None
 
 def auto_report():
     print("--- Auto-reporting device info ---")
@@ -323,7 +242,6 @@ def auto_report():
     print("--- Auto-report done ---")
 
 DEVICE_ID = get_or_register_device()
-
 auto_report()
 
 AUTO_REPORT_INTERVAL = 60
@@ -349,20 +267,6 @@ while True:
                     if cmd["command_type"] == "PING":
                         print("Device Alive")
 
-                    elif cmd["command_type"] == "ALARM":
-                        import threading
-                        _alarm_running = True
-                        t = threading.Thread(target=play_alarm, daemon=True)
-                        t.start()
-                        lock_device()
-                        print("ALARM TRIGGERED")
-
-                    elif cmd["command_type"] == "STOP_ALARM":
-                        _alarm_running = False
-                        subprocess.run(["pkill", "-f", "pw-cat"], check=False)
-                        subprocess.run(["pkill", "-f", "pw-play"], check=False)
-                        print("ALARM STOPPED")
-
                     elif cmd["command_type"] == "LOCK":
                         lock_device()
 
@@ -382,24 +286,8 @@ while True:
                         send_location()
 
                     elif cmd["command_type"] == "PHOTO":
-                        import cv2
-                        ret, frame = False, None
-                        camera = None
-                        for cam_index in range(4):
-                            try:
-                                camera = cv2.VideoCapture(cam_index)
-                                time.sleep(0.5)
-                                ret, frame = camera.read()
-                                camera.release()
-                                if ret:
-                                    print(f"Webcam found at index {cam_index}")
-                                    break
-                            except Exception:
-                                if camera:
-                                    camera.release()
-                        if ret and frame is not None:
-                            filename = "/tmp/pt_webcam.jpg"
-                            cv2.imwrite(filename, frame)
+                        filename = take_photo()
+                        if filename:
                             with open(filename, "rb") as photo_file:
                                 r = requests.post(
                                     f"{BASE_URL}/api/evidence/photo",
@@ -407,21 +295,21 @@ while True:
                                     data={"device_id": DEVICE_ID, "photo_type": "WEBCAM"}
                                 )
                             print("WEBCAM PHOTO SENT:", r.status_code)
-                        else:
-                            print("Webcam not available on any index")
+                            try: os.remove(filename)
+                            except: pass
 
                     elif cmd["command_type"] == "SCREENSHOT":
-                        import time as _time
-                        filename = f"/tmp/pt_screenshot_{int(_time.time())}.jpg"
-                        subprocess.run(["scrot", filename], check=True)
-                        with open(filename, "rb") as screen_file:
-                            r = requests.post(
-                                f"{BASE_URL}/api/evidence/photo",
-                                files={"photo": screen_file},
-                                data={"device_id": DEVICE_ID, "photo_type": "SCREENSHOT"}
-                            )
-                        os.remove(filename)
-                        print("SCREENSHOT SENT:", r.status_code)
+                        filename = take_screenshot()
+                        if filename:
+                            with open(filename, "rb") as screen_file:
+                                r = requests.post(
+                                    f"{BASE_URL}/api/evidence/photo",
+                                    files={"photo": screen_file},
+                                    data={"device_id": DEVICE_ID, "photo_type": "SCREENSHOT"}
+                                )
+                            print("SCREENSHOT SENT:", r.status_code)
+                            try: os.remove(filename)
+                            except: pass
 
                     requests.post(f"{BASE_URL}/api/command/acknowledge/{cmd['id']}")
                     requests.post(
