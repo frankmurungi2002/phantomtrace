@@ -46,7 +46,12 @@ import json
 IS_WINDOWS = platform.system() == "Windows"
 IS_LINUX = platform.system() == "Linux"
 
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'device.json')
+if getattr(sys, 'frozen', False):
+    # Running as PyInstaller exe
+    CONFIG_FILE = os.path.join(os.path.dirname(sys.executable), 'device.json')
+else:
+    # Running as script
+    CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'device.json')
 BASE_URL = "https://phantomtrace-backend-c0if.onrender.com"
 
 def get_or_register_device():
