@@ -45,7 +45,7 @@ import os
 import json
 
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), 'device.json')
-BASE_URL = "http://192.168.1.76:5000"
+BASE_URL = "https://phantomtrace-backend-c0if.onrender.com"
 
 def get_or_register_device():
     if os.path.exists(CONFIG_FILE):
