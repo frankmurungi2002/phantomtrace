@@ -576,6 +576,26 @@ with app.app_context():
     db.create_all()
     print("Database tables created successfully")
 
+
+@app.route('/api/device/self-register', methods=['POST'])
+def self_register():
+    data = request.get_json()
+    if not data or 'device_name' not in data:
+        return jsonify({'error': 'Device name required'}), 400
+    # Find first user or use a default
+    user = User.query.first()
+    if not user:
+        return jsonify({'error': 'No users found'}), 404
+    device = Device(
+        user_id=user.id,
+        device_name=data['device_name'],
+        beacon_id=str(uuid.uuid4()).replace('-',''),
+        gsm_number=''
+    )
+    db.session.add(device)
+    db.session.commit()
+    return jsonify({'device_id': device.id, 'message': 'Device registered'}), 201
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     debug = os.environ.get('FLASK_DEBUG', '1') == '1'
