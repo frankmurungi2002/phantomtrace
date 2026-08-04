@@ -185,7 +185,10 @@ def lock_device():
             ctypes.windll.user32.LockWorkStation()
             print("DEVICE LOCKED via LockWorkStation")
         else:
-            subprocess.run(["loginctl", "lock-session"], check=False)
+            env = os.environ.copy()
+            env['DISPLAY'] = ':0'
+            env['XAUTHORITY'] = '/root/.Xauthority'
+            subprocess.run(["loginctl", "lock-session"], env=env, check=False)
             print("DEVICE LOCKED via loginctl")
     except Exception as e:
         print(f"Lock failed: {e}")
@@ -200,7 +203,33 @@ def take_screenshot():
             img.save(filename, "JPEG")
         else:
             filename = f"/tmp/pt_screenshot_{int(time.time())}.jpg"
-            subprocess.run(["scrot", filename], check=True)
+            # Find correct XAUTHORITY file
+            import glob
+            xauth_files = glob.glob("/run/user/*/xauthority") +                           glob.glob("/tmp/.xauth*") +                           glob.glob("/root/.Xauthority") +                           glob.glob("/home/*/.Xauthority")
+            xauth = next((f for f in xauth_files if os.path.exists(f)), None)
+            env = os.environ.copy()
+            env['DISPLAY'] = ':0'
+            if xauth:
+                env['XAUTHORITY'] = xauth
+                print(f"Using XAUTHORITY: {xauth}")
+            # Use gnome-screenshot or scrot with proper env
+            taken = False
+            for cmd_try in [
+                ["gnome-screenshot", "-f", filename],
+                ["scrot", filename],
+                ["import", "-window", "root", filename],
+            ]:
+                try:
+                    r = subprocess.run(cmd_try, env=env, 
+                        capture_output=True, timeout=15)
+                    if r.returncode == 0 and os.path.exists(filename):
+                        taken = True
+                        print(f"Screenshot taken with {cmd_try[0]}")
+                        break
+                except Exception as ex:
+                    print(f"{cmd_try[0]} failed: {ex}")
+            if not taken:
+                raise Exception("All screenshot methods failed")
         return filename
     except Exception as e:
         print(f"Screenshot error: {e}")
@@ -274,6 +303,32 @@ while True:
 
                     elif cmd["command_type"] == "LOCK":
                         lock_device()
+
+                    elif cmd["command_type"] == "ALARM":
+                        import threading
+                        def alarm_thread():
+                            try:
+                                env = os.environ.copy()
+                                env['DISPLAY'] = ':0'
+                                env['XAUTHORITY'] = '/root/.Xauthority'
+                                # Max volume
+                                subprocess.run(["amixer", "sset", "Master", "100%", "unmute"], 
+                                    capture_output=True, check=False)
+                                # Generate and play alarm sound
+                                alarm_file = "/tmp/pt_alarm.wav"
+                                subprocess.run([
+                                    "ffmpeg", "-y", "-f", "lavfi",
+                                    "-i", "sine=frequency=1000:duration=30",
+                                    alarm_file
+                                ], capture_output=True, check=False)
+                                for _ in range(5):
+                                    subprocess.run(["aplay", alarm_file], 
+                                        env=env, capture_output=True, check=False)
+                            except Exception as e:
+                                print(f"Alarm error: {e}")
+                        threading.Thread(target=alarm_thread, daemon=True).start()
+                        lock_device()
+                        print("ALARM TRIGGERED")
 
                     elif cmd["command_type"] == "SYSTEM_INFO":
                         send_system_info()
