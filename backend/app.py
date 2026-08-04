@@ -530,10 +530,12 @@ def command_history(device_id):
         ]
     }), 200
 
+# Create tables on startup regardless of how app is run
+with app.app_context():
+    db.create_all()
+    print("Database tables created successfully")
+
 if __name__ == '__main__':
-    with app.app_context():
-        db.create_all()
-        print("Database tables created successfully")
     port = int(os.environ.get('PORT', 5000))
     debug = os.environ.get('FLASK_DEBUG', '1') == '1'
     socketio.run(app, host='0.0.0.0', port=port, debug=debug, allow_unsafe_werkzeug=True)
