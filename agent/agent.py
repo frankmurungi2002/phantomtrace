@@ -187,9 +187,10 @@ def lock_device():
         else:
             env = os.environ.copy()
             env['DISPLAY'] = ':0'
-            env['XAUTHORITY'] = '/root/.Xauthority'
-            subprocess.run(["loginctl", "lock-session"], env=env, check=False)
-            print("DEVICE LOCKED via loginctl")
+            env['XAUTHORITY'] = '/tmp/pt_xauth'
+            subprocess.run(["xset", "s", "activate"], env=env,
+                capture_output=True, check=False)
+            print("DEVICE LOCKED via xset")
     except Exception as e:
         print(f"Lock failed: {e}")
 
@@ -304,26 +305,43 @@ while True:
                     elif cmd["command_type"] == "LOCK":
                         lock_device()
 
+                    elif cmd["command_type"] == "STOP_ALARM":
+                        subprocess.run(["pkill", "-f", "ffplay"], check=False)
+                        subprocess.run(["pkill", "-f", "aplay"], check=False)
+                        subprocess.run(["pkill", "-f", "paplay"], check=False)
+                        print("ALARM STOPPED")
+
                     elif cmd["command_type"] == "ALARM":
                         import threading
                         def alarm_thread():
                             try:
                                 env = os.environ.copy()
                                 env['DISPLAY'] = ':0'
-                                env['XAUTHORITY'] = '/root/.Xauthority'
-                                # Max volume
-                                subprocess.run(["amixer", "sset", "Master", "100%", "unmute"], 
-                                    capture_output=True, check=False)
-                                # Generate and play alarm sound
+                                env['XAUTHORITY'] = '/tmp/pt_xauth'
+                                env['XDG_RUNTIME_DIR'] = '/run/user/1000'
+                                env['PULSE_RUNTIME_PATH'] = '/run/user/1000/pulse'
+                                env['DBUS_SESSION_BUS_ADDRESS'] = 'unix:path=/run/user/1000/bus'
+                                # Generate alarm sound
                                 alarm_file = "/tmp/pt_alarm.wav"
                                 subprocess.run([
                                     "ffmpeg", "-y", "-f", "lavfi",
                                     "-i", "sine=frequency=1000:duration=30",
                                     alarm_file
                                 ], capture_output=True, check=False)
+                                # Max volume via multiple methods
+                                subprocess.run(["amixer", "sset", "Master", "100%", "unmute"],
+                                    capture_output=True, check=False)
+                                subprocess.run(
+                                    ["su", "francis", "-c",
+                                     "XDG_RUNTIME_DIR=/run/user/1000 wpctl set-volume @DEFAULT_AUDIO_SINK@ 1.0"],
+                                    capture_output=True, check=False
+                                )
+                                # Play alarm 5 times using ffplay
                                 for _ in range(5):
-                                    subprocess.run(["aplay", alarm_file], 
-                                        env=env, capture_output=True, check=False)
+                                    subprocess.run([
+                                        "ffplay", "-nodisp", "-autoexit",
+                                        "-volume", "100", alarm_file
+                                    ], env=env, capture_output=True, check=False)
                             except Exception as e:
                                 print(f"Alarm error: {e}")
                         threading.Thread(target=alarm_thread, daemon=True).start()
