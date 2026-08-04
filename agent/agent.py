@@ -1,3 +1,39 @@
+import subprocess
+import sys
+import platform as _platform_check
+
+def _ensure_dependencies():
+    """Auto-install missing dependencies on first run, cross-platform."""
+    required = ["requests", "opencv-python"]
+    if _platform_check.system() == "Windows":
+        required += ["pycaw", "comtypes"]
+
+    import importlib
+    import_names = {
+        "requests": "requests",
+        "opencv-python": "cv2",
+        "pycaw": "pycaw",
+        "comtypes": "comtypes",
+    }
+
+    missing = []
+    for pkg in required:
+        mod_name = import_names.get(pkg, pkg)
+        try:
+            importlib.import_module(mod_name)
+        except ImportError:
+            missing.append(pkg)
+
+    if missing:
+        print(f"Installing missing dependencies: {missing}")
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--quiet"] + missing,
+            check=False
+        )
+        print("Dependency install complete.")
+
+_ensure_dependencies()
+
 import requests
 import time
 import platform
@@ -5,12 +41,11 @@ import socket
 import getpass
 import uuid
 import shutil
-import subprocess
 import os
 import json
 
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), 'device.json')
-BASE_URL = "http://10.31.49.252:5000"
+BASE_URL = "http://192.168.1.76:5000"
 
 def get_or_register_device():
     if os.path.exists(CONFIG_FILE):
@@ -138,33 +173,138 @@ def lock_device():
 
 _alarm_running = False
 
+def _set_volume(level):
+    """Cross-platform volume set. level is 0.0-1.0."""
+    system = platform.system()
+    if system == "Linux":
+        _set_volume_linux(level)
+    elif system == "Windows":
+        _set_volume_windows(level)
+    elif system == "Darwin":
+        _set_volume_macos(level)
+
+def _set_volume_linux(level):
+    # Try PipeWire first (works on most normal Linux setups)
+    try:
+        result = subprocess.run(
+            ["su", "francis", "-c",
+             f"XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus wpctl set-volume @DEFAULT_AUDIO_SINK@ {level}"],
+            check=False, capture_output=True, text=True
+        )
+        if result.returncode == 0 and "error" not in (result.stderr or "").lower():
+            return
+    except Exception:
+        pass
+    # Fallback: raw ALSA amixer (covers machines where PipeWire routing is broken)
+    try:
+        pct = int(level * 100)
+        subprocess.run(["amixer", "sset", "Master", f"{pct}%", "unmute"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["amixer", "sset", "Speaker", f"{pct}%", "unmute"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        print(f"Linux volume fallback error: {e}")
+
+def _set_volume_windows(level):
+    try:
+        from ctypes import cast, POINTER
+        from comtypes import CLSCTX_ALL
+        from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+        devices = AudioUtilities.GetSpeakers()
+        interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+        volume = cast(interface, POINTER(IAudioEndpointVolume))
+        volume.SetMasterVolumeLevelScalar(level, None)
+    except Exception as e:
+        print(f"Windows volume error (is pycaw installed? pip install pycaw comtypes): {e}")
+
+def _set_volume_macos(level):
+    try:
+        pct = int(level * 100)
+        subprocess.run(["osascript", "-e", f"set volume output volume {pct}"], check=False)
+    except Exception as e:
+        print(f"macOS volume error: {e}")
+
+def _play_sound_linux(path):
+    try:
+        proc = subprocess.Popen(["ffplay", "-nodisp", "-autoexit", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return proc
+    except Exception:
+        try:
+            proc = subprocess.Popen(["aplay", "-D", "plughw:0,0", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return proc
+        except Exception as e:
+            print(f"Linux playback error: {e}")
+            return None
+
+def _play_sound_windows(path):
+    try:
+        import winsound
+        winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_LOOP)
+        return "winsound"
+    except Exception as e:
+        print(f"Windows playback error: {e}")
+        return None
+
+def _play_sound_macos(path):
+    try:
+        proc = subprocess.Popen(["afplay", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return proc
+    except Exception as e:
+        print(f"macOS playback error: {e}")
+        return None
+
 def play_alarm():
     global _alarm_running
     _alarm_running = True
-    print("ALARM STARTED")
-    # Force volume to max once
-    subprocess.run(["amixer", "-q", "sset", "Master", "100%"], check=False)
-    # Generate a beep tone file
-    subprocess.run([
-        "ffmpeg", "-y", "-f", "lavfi",
-        "-i", "sine=frequency=1000:duration=30",
-        "/tmp/pt_alarm.wav"
-    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    system = platform.system()
+    print(f"ALARM STARTED (OS: {system})")
+    import time as _t
+
+    if system == "Windows":
+        alarm_file = os.path.join(os.environ.get("TEMP", "."), "pt_alarm.wav")
+    else:
+        alarm_file = "/tmp/pt_alarm.wav"
+
+    try:
+        subprocess.run([
+            "ffmpeg", "-y", "-f", "lavfi",
+            "-i", "sine=frequency=1000:duration=30",
+            alarm_file
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    except Exception as e:
+        print(f"ffmpeg not available, alarm may be silent: {e}")
+
+    # Gradual ramp from 10% to 100% over ~5 seconds
+    for step in [0.10, 0.25, 0.40, 0.55, 0.70, 0.85, 1.0]:
+        _set_volume(step)
+        _t.sleep(0.7)
+
     while _alarm_running:
         try:
-            subprocess.run(["amixer", "-q", "sset", "Master", "100%"], check=False)
-            proc = subprocess.Popen(
-                ["ffplay", "-nodisp", "-autoexit", "/tmp/pt_alarm.wav"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-            import time as _t
-            while _alarm_running and proc.poll() is None:
-                subprocess.run(["amixer", "-q", "sset", "Master", "100%"], check=False)
-                _t.sleep(1)
-            proc.terminate()
+            _set_volume(1.0)
+            if system == "Linux":
+                proc = _play_sound_linux(alarm_file)
+            elif system == "Windows":
+                proc = _play_sound_windows(alarm_file)
+            elif system == "Darwin":
+                proc = _play_sound_macos(alarm_file)
+            else:
+                proc = None
+
+            if proc == "winsound":
+                while _alarm_running:
+                    _set_volume(1.0)
+                    _t.sleep(1)
+                import winsound
+                winsound.PlaySound(None, winsound.SND_PURGE)
+            elif proc is not None:
+                while _alarm_running and proc.poll() is None:
+                    _set_volume(1.0)
+                    _t.sleep(1)
+                proc.terminate()
+            else:
+                print("No playback method available on this OS")
+                _t.sleep(2)
         except Exception as e:
             print(f"Alarm error: {e}")
-            import time as _t
             _t.sleep(1)
     print("ALARM STOPPED")
 
