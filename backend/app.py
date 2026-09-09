@@ -115,6 +115,7 @@ class User(db.Model):
     email = db.Column(db.String(120), unique=True, nullable=False)
     phone = db.Column(db.String(20), nullable=False)
     password_hash = db.Column(db.String(255), nullable=False)
+    fcm_token = db.Column(db.Text)  # phone's Firebase Cloud Messaging token for push notifications
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 class Device(db.Model):
@@ -641,6 +642,16 @@ def command_history(device_id):
 with app.app_context():
     db.create_all()
     print("Database tables created successfully")
+    # create_all() does NOT add new columns to existing tables — add fcm_token if missing
+    try:
+        db.session.execute(db.text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS fcm_token TEXT"
+        ))
+        db.session.commit()
+        print("Migration: fcm_token column ensured")
+    except Exception as _mig_err:
+        db.session.rollback()
+        print(f"Migration warning (fcm_token): {_mig_err}")
 
 
 @app.route('/api/device/self-register', methods=['POST'])
