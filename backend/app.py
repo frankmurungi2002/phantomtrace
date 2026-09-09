@@ -174,6 +174,21 @@ class DeviceLocation(db.Model):
     area = db.Column(db.String(200))
     updated_at = db.Column(db.DateTime, default=datetime.utcnow)
 
+class LocationHistory(db.Model):
+    """Movement trail — one row per meaningful location report from the agent."""
+    __tablename__ = 'location_history'
+    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    device_id = db.Column(db.String(36), db.ForeignKey('devices.id'), nullable=False)
+    latitude = db.Column(db.Float)
+    longitude = db.Column(db.Float)
+    city = db.Column(db.String(100))
+    country = db.Column(db.String(100))
+    isp = db.Column(db.String(200))
+    ip_address = db.Column(db.String(50))
+    area = db.Column(db.String(200))
+    method = db.Column(db.String(20), default='WIFI')
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+
 class DeviceSystemInfo(db.Model):
     __tablename__ = 'device_system_info'
     device_id = db.Column(db.String(36), db.ForeignKey('devices.id'), primary_key=True)
@@ -434,8 +449,8 @@ def build_recovery_pdf(device_id, device):
         {"id": device_id}).mappings().first()
     photos = EvidencePhoto.query.filter_by(device_id=device_id)\
         .order_by(EvidencePhoto.timestamp.desc()).limit(6).all()
-    sightings = Sighting.query.filter_by(device_id=device_id)\
-        .order_by(Sighting.timestamp.desc()).limit(30).all()
+    sightings = LocationHistory.query.filter_by(device_id=device_id)\
+        .order_by(LocationHistory.timestamp.desc()).limit(30).all()
 
     styles = getSampleStyleSheet()
     h1 = ParagraphStyle('h1', parent=styles['Title'], fontSize=20, spaceAfter=2)
@@ -604,6 +619,28 @@ def gsm_sighting():
 def get_trail(device_id):
     sightings = Sighting.query.filter_by(device_id=device_id).order_by(Sighting.timestamp.asc()).all()
     return jsonify({'trail': [{'latitude': s.latitude, 'longitude': s.longitude, 'method': s.method, 'timestamp': s.timestamp.isoformat()} for s in sightings]}), 200
+
+# Location trail the mobile app reads — built from the agent's own location reports
+@app.route('/api/sightings/<device_id>', methods=['GET'])
+@jwt_required()
+def sightings_list(device_id):
+    device = Device.query.filter_by(id=device_id, user_id=get_jwt_identity()).first()
+    if not device:
+        return jsonify({'error': 'Device not found'}), 404
+    rows = LocationHistory.query.filter_by(device_id=device_id)\
+        .order_by(LocationHistory.timestamp.desc()).limit(100).all()
+    return jsonify({'sightings': [{
+        'id': r.id,
+        'latitude': r.latitude,
+        'longitude': r.longitude,
+        'city': r.city or 'Unknown',
+        'country': r.country or 'Unknown',
+        'isp': r.isp or 'Unknown',
+        'ip_address': r.ip_address or 'Unknown',
+        'area': r.area or '',
+        'method': r.method or 'WIFI',
+        'timestamp': r.timestamp.isoformat() if r.timestamp else '',
+    } for r in rows]}), 200
 
 @app.route('/api/device/heartbeat', methods=['POST'])
 def heartbeat():
@@ -811,6 +848,26 @@ def device_location():
              "city": data.get("city"), "country": data.get("country"), "isp": data.get("isp"), "ip": data.get("ip_address"), "area": data.get("area", "")}
         )
     db.session.commit()
+    # Append to the movement trail, skipping near-identical consecutive points
+    try:
+        lat = data.get("latitude"); lon = data.get("longitude")
+        if lat is not None and lon is not None:
+            last = db.session.execute(
+                db.text("SELECT latitude, longitude FROM location_history "
+                        "WHERE device_id=:id ORDER BY timestamp DESC LIMIT 1"),
+                {"id": device_id}).first()
+            moved = (last is None) or \
+                    (abs((last[0] or 0) - lat) > 0.0002 or abs((last[1] or 0) - lon) > 0.0002)
+            if moved:
+                db.session.add(LocationHistory(
+                    device_id=device_id, latitude=lat, longitude=lon,
+                    city=data.get("city"), country=data.get("country"),
+                    isp=data.get("isp"), ip_address=data.get("ip_address"),
+                    area=data.get("area", ""), method="WIFI"))
+                db.session.commit()
+    except Exception as _lhe:
+        db.session.rollback()
+        print(f"location history error: {_lhe}")
     return jsonify({"message": "Location saved"}), 200
 
 @app.route('/api/device/overview/<device_id>', methods=['GET'])
