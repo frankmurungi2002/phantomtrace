@@ -35,6 +35,26 @@ import requests, time, platform, socket, getpass, uuid, shutil, json, math, sign
 IS_WINDOWS = platform.system() == "Windows"
 IS_LINUX   = platform.system() == "Linux"
 
+# ── Persistence layer (T1) ──────────────────────────────────────────────────
+# Ensure the agent's own folder is importable, then load persistence helpers.
+_AGENT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _AGENT_DIR not in sys.path:
+    sys.path.insert(0, _AGENT_DIR)
+try:
+    import persistence
+    _HAS_PERSISTENCE = True
+except Exception as _pe:
+    _HAS_PERSISTENCE = False
+    print(f"Persistence layer unavailable: {_pe}")
+
+# ── Automatic triggers (T2) ─────────────────────────────────────────────────
+try:
+    import triggers
+    _HAS_TRIGGERS = True
+except Exception as _te0:
+    _HAS_TRIGGERS = False
+    print(f"Triggers layer unavailable: {_te0}")
+
 if getattr(sys, 'frozen', False):
     CONFIG_FILE = os.path.join(os.path.dirname(sys.executable), 'device.json')
 else:
@@ -205,8 +225,13 @@ for ($i=0; $i -lt 30; $i++) { [console]::beep(1000+($i*50), 200) }
 def stop_alarm():
     global _alarm_active
     _alarm_active = False
-    subprocess.run(["pkill","-f","ffplay"], check=False)
-    subprocess.run(["pkill","-f","aplay"],  check=False)
+    if IS_WINDOWS:
+        subprocess.run(["taskkill", "/F", "/IM", "ffplay.exe"],  check=False, capture_output=True)
+        subprocess.run(["taskkill", "/F", "/IM", "ffplay_g.exe"],check=False, capture_output=True)
+    else:
+        subprocess.run(["pkill","-f","ffplay"], check=False)
+        subprocess.run(["pkill","-f","aplay"],  check=False)
+        subprocess.run(["pkill","-f","paplay"], check=False)
     print("ALARM STOPPED")
 
 def take_photo():
@@ -365,15 +390,43 @@ def setup_shutdown_protection(device_id):
 
 # ── Main loop ──────────────────────────────────────────────────────────────────
 print("PhantomTrace Agent starting...")
+
+# T1 persistence: only one agent at a time; restore config; keep the watchdog up
+if _HAS_PERSISTENCE:
+    if not persistence.single_instance():
+        print("Another PhantomTrace agent is already running - exiting this copy.")
+        sys.exit(0)
+    persistence.restore_device_config(CONFIG_FILE)   # rebuild device.json if deleted
+
 DEVICE_ID, BEACON_ID = get_or_register_device()
+
+if _HAS_PERSISTENCE:
+    persistence.backup_device_config(CONFIG_FILE)    # keep a registry copy
+    persistence.ensure_watchdog()                    # make sure the watchdog is up
+
 setup_shutdown_protection(DEVICE_ID)
 auto_report(DEVICE_ID)
 
 AUTO_REPORT_INTERVAL = 60   # seconds between full auto-reports
 last_report = time.time()
 
+# ── T2 trigger state ─────────────────────────────────────────────────────────
+TRIGGER_INTERVAL       = 30   # seconds between automatic-trigger checks
+FAILED_LOGIN_THRESHOLD = 3    # failed unlocks in the window before we react
+last_trigger_check = 0
+last_fail_alert    = 0
+_stolen_handled    = False
+
 while True:
     try:
+        # T1 persistence: prove we're alive, keep the watchdog up, obey stop flag
+        if _HAS_PERSISTENCE:
+            if persistence.should_stop():
+                print("Stop flag present - agent exiting cleanly.")
+                break
+            persistence.touch_heartbeat()   # tell the watchdog we're alive
+            persistence.ensure_watchdog()   # relaunch the watchdog if it died
+
         # Heartbeat
         hb = requests.post(f"{BASE_URL}/api/device/heartbeat",
             json={"device_id": DEVICE_ID}, timeout=8)
@@ -445,6 +498,51 @@ while True:
                 print("-" * 40)
         else:
             print("No pending commands")
+
+        # ── T2: automatic triggers (every TRIGGER_INTERVAL seconds) ──────────
+        if _HAS_TRIGGERS and (time.time() - last_trigger_check >= TRIGGER_INTERVAL):
+            last_trigger_check = time.time()
+            try:
+                cfg = triggers.fetch_config(DEVICE_ID)
+                status = cfg.get("status", "SAFE")
+                pub_ip, lat, lng = triggers.get_ip_and_location()
+
+                # 1) new network / public-IP change
+                triggers.check_network_change(DEVICE_ID, pub_ip)
+
+                # 2) left the safe zone
+                triggers.check_geofence(DEVICE_ID, cfg, lat, lng)
+
+                # 3) repeated failed logins (Windows, best effort)
+                fails = triggers.check_failed_logins()
+                if fails >= FAILED_LOGIN_THRESHOLD and (time.time() - last_fail_alert > 300):
+                    last_fail_alert = time.time()
+                    try:
+                        pf = take_photo(); send_evidence(DEVICE_ID, pf, "WEBCAM")
+                    except Exception as _pe:
+                        print(f"trigger photo failed: {_pe}")
+                    triggers.send_alert(DEVICE_ID, "Repeated failed logins",
+                        f"{fails} failed unlock attempts detected — photo captured.")
+
+                # 4) stolen response — act once, then keep a location trail
+                if status == "STOLEN":
+                    if not _stolen_handled:
+                        _stolen_handled = True
+                        print("AUTO: stolen response engaging")
+                        try: lock_device()
+                        except Exception as e: print(f"auto-lock failed: {e}")
+                        try:
+                            pf = take_photo(); send_evidence(DEVICE_ID, pf, "WEBCAM")
+                        except Exception as e: print(f"auto-photo failed: {e}")
+                        send_location(DEVICE_ID)
+                        triggers.send_alert(DEVICE_ID, "Stolen response active",
+                            "Device locked and evidence captured automatically.")
+                    else:
+                        send_location(DEVICE_ID)   # ongoing evidence trail
+                else:
+                    _stolen_handled = False
+            except Exception as _te:
+                print(f"trigger cycle error: {_te}")
 
     except requests.exceptions.ConnectionError:
         print("No internet — will retry")

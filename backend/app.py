@@ -129,6 +129,10 @@ class Device(db.Model):
     registered_at = db.Column(db.DateTime, default=datetime.utcnow)
     stolen_at = db.Column(db.DateTime)
     last_seen = db.Column(db.DateTime, default=datetime.utcnow)
+    # T2 geofence (safe zone) — set by the owner, read by the agent
+    home_lat = db.Column(db.Float)
+    home_lng = db.Column(db.Float)
+    geofence_radius = db.Column(db.Float)  # metres
 
 class Sighting(db.Model):
     __tablename__ = 'sightings'
@@ -348,6 +352,52 @@ def mark_found(device_id):
     device.status = 'SAFE'
     db.session.commit()
     return jsonify({'message': 'Device marked safe', 'status': 'SAFE'}), 200
+
+# ── T2: geofence (safe zone) — owner sets it, agent reads it ──────────────────
+@app.route('/api/device/<device_id>/geofence', methods=['GET', 'POST'])
+@jwt_required()
+def device_geofence(device_id):
+    device = Device.query.filter_by(id=device_id, user_id=get_jwt_identity()).first()
+    if not device:
+        return jsonify({'error': 'Device not found'}), 404
+    if request.method == 'POST':
+        data = request.get_json() or {}
+        device.home_lat = data.get('home_lat')
+        device.home_lng = data.get('home_lng')
+        device.geofence_radius = data.get('geofence_radius')
+        db.session.commit()
+        return jsonify({'message': 'Geofence saved'}), 200
+    return jsonify({
+        'home_lat': device.home_lat,
+        'home_lng': device.home_lng,
+        'geofence_radius': device.geofence_radius,
+    }), 200
+
+# ── T2: agent polls this for its status + geofence (no JWT, keyed by device id) ─
+@app.route('/api/device/agent-config/<device_id>', methods=['GET'])
+def agent_config(device_id):
+    device = Device.query.filter_by(id=device_id).first()
+    if not device:
+        return jsonify({'error': 'Device not found'}), 404
+    return jsonify({
+        'status': device.status,
+        'home_lat': device.home_lat,
+        'home_lng': device.home_lng,
+        'geofence_radius': device.geofence_radius,
+    }), 200
+
+# ── T2: agent reports an automatic trigger → push to the owner ────────────────
+@app.route('/api/device/alert', methods=['POST'])
+def device_alert():
+    data = request.get_json() or {}
+    device_id = data.get('device_id')
+    title = data.get('title', 'PhantomTrace alert')
+    body = data.get('body', '')
+    if not device_id:
+        return jsonify({'error': 'Missing device_id'}), 400
+    notify_device_owner(device_id, title, body, {'device_id': str(device_id), 'kind': 'auto'})
+    print(f"Auto-alert for {device_id}: {title} — {body}")
+    return jsonify({'message': 'Alert dispatched'}), 200
 
 @app.route('/api/sighting/bluetooth', methods=['POST'])
 def bluetooth_sighting():
@@ -675,6 +725,19 @@ with app.app_context():
     except Exception as _mig_err:
         db.session.rollback()
         print(f"Migration warning (fcm_token): {_mig_err}")
+    # T2: geofence columns on devices
+    for _col in ("home_lat DOUBLE PRECISION",
+                 "home_lng DOUBLE PRECISION",
+                 "geofence_radius DOUBLE PRECISION"):
+        try:
+            db.session.execute(db.text(
+                f"ALTER TABLE devices ADD COLUMN IF NOT EXISTS {_col}"
+            ))
+            db.session.commit()
+        except Exception as _mig_err2:
+            db.session.rollback()
+            print(f"Migration warning (devices {_col}): {_mig_err2}")
+    print("Migration: geofence columns ensured")
 
 
 @app.route('/api/device/self-register', methods=['POST'])
