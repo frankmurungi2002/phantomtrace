@@ -17,17 +17,22 @@ try:
     _cred_dict = None
 
     # Method 1: individual env vars (easiest to set in Render)
-    _fb_private_key = os.environ.get('FIREBASE_PRIVATE_KEY', '')
     _fb_client_email = os.environ.get('FIREBASE_CLIENT_EMAIL', '')
-    if _fb_private_key and _fb_client_email:
-        # Normalize the key: handle literal \n, Windows CRLF, and strip extra whitespace
-        _fb_private_key = _fb_private_key.replace('\\n', '\n')   # literal \n → newline
-        _fb_private_key = _fb_private_key.replace('\r\n', '\n')  # CRLF → LF
-        _fb_private_key = _fb_private_key.replace('\r', '\n')    # stray CR → LF
-        _fb_private_key = _fb_private_key.strip()                # remove leading/trailing whitespace
-        # Ensure it ends with a newline (PEM requirement)
+    # Accept private key as base64 (preferred, avoids newline corruption) or raw PEM
+    _fb_pk_b64 = os.environ.get('FIREBASE_PRIVATE_KEY_B64', '').strip()
+    _fb_pk_raw = os.environ.get('FIREBASE_PRIVATE_KEY', '').strip()
+    if _fb_pk_b64:
+        _fb_private_key = base64.b64decode(_fb_pk_b64).decode()
+        print("Firebase: private key from FIREBASE_PRIVATE_KEY_B64")
+    elif _fb_pk_raw:
+        # Normalize: handle literal \n sequences and Windows CRLF
+        _fb_private_key = _fb_pk_raw.replace('\\n', '\n').replace('\r\n', '\n').replace('\r', '\n').strip()
         if not _fb_private_key.endswith('\n'):
             _fb_private_key += '\n'
+        print("Firebase: private key from FIREBASE_PRIVATE_KEY")
+    else:
+        _fb_private_key = ''
+    if _fb_private_key and _fb_client_email:
         _cred_dict = {
             "type": "service_account",
             "project_id": os.environ.get('FIREBASE_PROJECT_ID', 'phantomtrace-ce048'),
