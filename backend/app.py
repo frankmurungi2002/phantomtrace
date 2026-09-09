@@ -476,7 +476,7 @@ def send_command():
     data = request.get_json()
     if not data or not all(k in data for k in ['device_id','command_type']):
         return jsonify({'error': 'Missing fields'}), 400
-    if data['command_type'] not in ['LOCK','PHOTO','ALARM','AUDIO','WIPE','PING','SYSTEM_INFO','GET_NETWORK','GET_DISKS','GET_PROCESSES','SCREENSHOT','GET_LOCATION','STOP_ALARM']:
+    if data['command_type'] not in ['LOCK','PHOTO','ALARM','AUDIO','WIPE','SYSTEM_INFO','GET_NETWORK','GET_DISKS','GET_PROCESSES','SCREENSHOT','GET_LOCATION','STOP_ALARM']:
         return jsonify({'error': 'Invalid command'}), 400
     command = Command(device_id=data['device_id'], command_type=data['command_type'])
     db.session.add(command)
@@ -628,7 +628,6 @@ def command_result():
         device = Device.query.filter_by(id=dev_id).first()
         dname = device.device_name if device else 'your device'
         labels = {
-            'PING':        ('Device responded',   f'{dname} is online and responding'),
             'LOCK':        ('Device locked',       f'{dname} has been locked'),
             'ALARM':       ('Alarm triggered',     f'Alarm is sounding on {dname}'),
             'STOP_ALARM':  ('Alarm stopped',       f'Alarm stopped on {dname}'),
