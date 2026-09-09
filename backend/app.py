@@ -226,7 +226,10 @@ def notify_device_owner(device_id, title, body, data=None):
             {"id": device_id}
         ).first()
         if result and result[0]:
+            print(f"notify: owner has FCM token, sending '{title}'")
             send_push(result[0], title, body, data or {})
+        else:
+            print(f"notify: NO FCM token for device {device_id} — owner must log in on the app to register it")
     except Exception as e:
         print(f"notify error: {e}")
 
@@ -618,6 +621,27 @@ def command_result():
         data
     )
     db.session.commit()
+    # Push a notification to the owner now that the command has completed
+    try:
+        dev_id = data.get('device_id')
+        ctype = data.get('command_type', 'Command')
+        device = Device.query.filter_by(id=dev_id).first()
+        dname = device.device_name if device else 'your device'
+        labels = {
+            'PING':        ('Device responded',   f'{dname} is online and responding'),
+            'LOCK':        ('Device locked',       f'{dname} has been locked'),
+            'ALARM':       ('Alarm triggered',     f'Alarm is sounding on {dname}'),
+            'STOP_ALARM':  ('Alarm stopped',       f'Alarm stopped on {dname}'),
+            'PHOTO':       ('Photo captured',      f'Evidence photo captured from {dname}'),
+            'SCREENSHOT':  ('Screenshot captured', f'Screenshot captured from {dname}'),
+            'AUDIO':       ('Audio recorded',      f'Audio evidence recorded from {dname}'),
+            'GET_LOCATION':('Location updated',    f'New location received from {dname}'),
+            'WIPE':        ('Wipe completed',      f'Data wipe completed on {dname}'),
+        }
+        title, body = labels.get(ctype, (f'{ctype} completed', f'{ctype} finished on {dname}'))
+        notify_device_owner(dev_id, title, body, {'device_id': str(dev_id), 'command_type': str(ctype)})
+    except Exception as _e:
+        print(f"command_result notify error: {_e}")
     return jsonify({"message":"Result saved"}), 200
 
 @app.route('/api/command/history/<device_id>', methods=['GET'])
