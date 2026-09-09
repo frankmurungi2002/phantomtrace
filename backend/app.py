@@ -11,23 +11,55 @@ import firebase_admin
 from firebase_admin import credentials, messaging
 import base64, json as _json
 
-# Initialize Firebase — support both local file and env-var (base64-encoded JSON)
+# Initialize Firebase — try multiple credential sources
 _fb_initialized = False
 try:
-    _cred_b64 = os.environ.get('FIREBASE_CREDENTIALS_B64', '')
-    if _cred_b64:
-        _cred_dict = _json.loads(base64.b64decode(_cred_b64).decode())
-        firebase_admin.initialize_app(credentials.Certificate(_cred_dict))
-        _fb_initialized = True
-        print("Firebase initialized from env var")
-    else:
+    _cred_dict = None
+
+    # Method 1: individual env vars (easiest to set in Render)
+    _fb_private_key = os.environ.get('FIREBASE_PRIVATE_KEY', '')
+    _fb_client_email = os.environ.get('FIREBASE_CLIENT_EMAIL', '')
+    if _fb_private_key and _fb_client_email:
+        # Render sometimes converts literal \n to actual newlines; handle both
+        _fb_private_key = _fb_private_key.replace('\\n', '\n')
+        _cred_dict = {
+            "type": "service_account",
+            "project_id": os.environ.get('FIREBASE_PROJECT_ID', 'phantomtrace-ce048'),
+            "private_key_id": os.environ.get('FIREBASE_PRIVATE_KEY_ID', ''),
+            "private_key": _fb_private_key,
+            "client_email": _fb_client_email,
+            "client_id": os.environ.get('FIREBASE_CLIENT_ID', ''),
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+            "client_x509_cert_url": f"https://www.googleapis.com/robot/v1/metadata/x509/{_fb_client_email.replace('@', '%40')}",
+            "universe_domain": "googleapis.com"
+        }
+        print("Firebase: using individual env vars")
+
+    # Method 2: base64-encoded JSON blob
+    if _cred_dict is None:
+        _cred_b64 = os.environ.get('FIREBASE_CREDENTIALS_B64', '').strip()
+        if _cred_b64:
+            # Fix padding if truncated
+            _cred_b64 += '=' * (4 - len(_cred_b64) % 4) if len(_cred_b64) % 4 else ''
+            _cred_dict = _json.loads(base64.b64decode(_cred_b64).decode())
+            print("Firebase: using base64 env var")
+
+    # Method 3: local JSON file
+    if _cred_dict is None:
         _cred_path = os.path.join(os.path.dirname(__file__), 'firebase-service-account.json')
         if os.path.exists(_cred_path):
-            firebase_admin.initialize_app(credentials.Certificate(_cred_path))
-            _fb_initialized = True
-            print("Firebase initialized from file")
-        else:
-            print("WARNING: No Firebase credentials found — push notifications disabled")
+            with open(_cred_path) as _f:
+                _cred_dict = _json.load(_f)
+            print("Firebase: using local file")
+
+    if _cred_dict:
+        firebase_admin.initialize_app(credentials.Certificate(_cred_dict))
+        _fb_initialized = True
+        print("Firebase initialized OK")
+    else:
+        print("WARNING: No Firebase credentials found — push notifications disabled")
 except Exception as _fb_err:
     print(f"Firebase init error: {_fb_err}")
 
