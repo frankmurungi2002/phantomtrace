@@ -970,6 +970,19 @@ with app.app_context():
             db.session.rollback()
             print(f"Migration warning (devices {_col}): {_mig_err2}")
     print("Migration: geofence columns ensured")
+    # Location history table may pre-exist from an older build with fewer columns
+    for _col in ("latitude DOUBLE PRECISION", "longitude DOUBLE PRECISION",
+                 "city VARCHAR(100)", "country VARCHAR(100)", "isp VARCHAR(200)",
+                 "ip_address VARCHAR(50)", "area VARCHAR(200)",
+                 "method VARCHAR(20)", "timestamp TIMESTAMP"):
+        try:
+            db.session.execute(db.text(
+                f"ALTER TABLE location_history ADD COLUMN IF NOT EXISTS {_col}"))
+            db.session.commit()
+        except Exception as _mig_err3:
+            db.session.rollback()
+            print(f"Migration warning (location_history {_col}): {_mig_err3}")
+    print("Migration: location_history columns ensured")
 
 
 @app.route('/api/device/self-register', methods=['POST'])
