@@ -23,7 +23,7 @@ try:
     _fb_pk_raw = os.environ.get('FIREBASE_PRIVATE_KEY', '').strip()
     if _fb_pk_b64:
         _fb_private_key = base64.b64decode(_fb_pk_b64).decode()
-        print("Firebase: private key from FIREBASE_PRIVATE_KEY_B64")
+        print(f"Firebase: private key from FIREBASE_PRIVATE_KEY_B64 (b64 len={len(_fb_pk_b64)})")
     elif _fb_pk_raw:
         # Normalize: handle literal \n sequences and Windows CRLF
         _fb_private_key = _fb_pk_raw.replace('\\n', '\n').replace('\r\n', '\n').replace('\r', '\n').strip()
@@ -46,7 +46,11 @@ try:
             "client_x509_cert_url": f"https://www.googleapis.com/robot/v1/metadata/x509/{_fb_client_email.replace('@', '%40')}",
             "universe_domain": "googleapis.com"
         }
-        print("Firebase: using individual env vars")
+        # Fingerprint lets us verify the key survived copy/paste intact.
+        # Expected: c1de05387e18
+        import hashlib as _hashlib
+        _fp = _hashlib.sha256(_fb_private_key.encode()).hexdigest()[:12]
+        print(f"Firebase: using individual env vars (key fingerprint={_fp}, expected=c1de05387e18)")
 
     # Method 2: base64-encoded JSON blob
     if _cred_dict is None:
