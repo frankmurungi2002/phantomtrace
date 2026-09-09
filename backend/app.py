@@ -103,6 +103,19 @@ class DeviceLocation(db.Model):
     area = db.Column(db.String(200))
     updated_at = db.Column(db.DateTime, default=datetime.utcnow)
 
+class LocationHistory(db.Model):
+    __tablename__ = 'location_history'
+    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    device_id = db.Column(db.String(36), db.ForeignKey('devices.id'), nullable=False)
+    latitude = db.Column(db.Float)
+    longitude = db.Column(db.Float)
+    city = db.Column(db.String(100))
+    country = db.Column(db.String(100))
+    isp = db.Column(db.String(200))
+    ip_address = db.Column(db.String(50))
+    area = db.Column(db.String(200))
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+
 class DeviceSystemInfo(db.Model):
     __tablename__ = 'device_system_info'
     device_id = db.Column(db.String(36), db.ForeignKey('devices.id'), primary_key=True)
@@ -212,18 +225,6 @@ def profile():
         return jsonify({'error': 'User not found'}), 404
     return jsonify({'id': user.id, 'name': user.name, 'email': user.email, 'phone': user.phone}), 200
 
-@app.route('/api/device/self-register', methods=['POST'])
-def self_register_device():
-    data = request.get_json()
-    device = Device(
-        user_id=db.session.execute(db.text('SELECT id FROM users LIMIT 1')).scalar(),
-        device_name=data.get('device_name', 'Unknown'),
-        beacon_id=str(uuid.uuid4()).replace('-',''),
-    )
-    db.session.add(device)
-    db.session.commit()
-    return jsonify({'message': 'Registered', 'device_id': device.id}), 201
-
 @app.route('/api/device/register', methods=['POST'])
 @jwt_required()
 def register_device():
@@ -267,6 +268,7 @@ def mark_stolen(device_id):
     device.status = 'STOLEN'
     device.stolen_at = datetime.utcnow()
     db.session.commit()
+    notify_device_owner(device.id, '🚨 Device Marked Stolen', f'{device.device_name} has been marked as stolen. Recovery mode activated.', {'device_id': device.id, 'status': 'STOLEN'})
     return jsonify({'message': 'Device marked stolen', 'status': 'STOLEN'}), 200
 
 @app.route('/api/device/<device_id>/mark-found', methods=['POST'])
@@ -515,8 +517,43 @@ def device_location():
             {"device_id": device_id, "lat": data.get("latitude"), "lon": data.get("longitude"),
              "city": data.get("city"), "country": data.get("country"), "isp": data.get("isp"), "ip": data.get("ip_address"), "area": data.get("area", "")}
         )
+    # Also insert a history record for the location trail
+    loc_history = LocationHistory(
+        device_id=device_id,
+        latitude=data.get("latitude"),
+        longitude=data.get("longitude"),
+        city=data.get("city"),
+        country=data.get("country"),
+        isp=data.get("isp"),
+        ip_address=data.get("ip_address"),
+        area=data.get("area", "")
+    )
+    db.session.add(loc_history)
     db.session.commit()
     return jsonify({"message": "Location saved"}), 200
+
+@app.route('/api/sightings/<device_id>', methods=['GET'])
+@jwt_required()
+def get_sightings(device_id):
+    """Returns the IP-based location trail for the Flutter app."""
+    rows = LocationHistory.query.filter_by(device_id=device_id).order_by(LocationHistory.timestamp.desc()).limit(100).all()
+    return jsonify({
+        'sightings': [
+            {
+                'id': r.id,
+                'latitude': r.latitude,
+                'longitude': r.longitude,
+                'city': r.city,
+                'country': r.country,
+                'isp': r.isp,
+                'ip_address': r.ip_address,
+                'area': r.area,
+                'method': 'IP',
+                'timestamp': r.timestamp.isoformat()
+            }
+            for r in rows
+        ]
+    }), 200
 
 @app.route('/api/device/overview/<device_id>', methods=['GET'])
 def device_overview(device_id):

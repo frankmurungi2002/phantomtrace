@@ -331,8 +331,10 @@ while True:
                                 # Max volume via multiple methods
                                 subprocess.run(["amixer", "sset", "Master", "100%", "unmute"],
                                     capture_output=True, check=False)
+                                import getpass as _gp
+                                _current_user = _gp.getuser()
                                 subprocess.run(
-                                    ["su", "francis", "-c",
+                                    ["su", _current_user, "-c",
                                      "XDG_RUNTIME_DIR=/run/user/1000 wpctl set-volume @DEFAULT_AUDIO_SINK@ 1.0"],
                                     capture_output=True, check=False
                                 )
