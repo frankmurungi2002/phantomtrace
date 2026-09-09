@@ -20,8 +20,14 @@ try:
     _fb_private_key = os.environ.get('FIREBASE_PRIVATE_KEY', '')
     _fb_client_email = os.environ.get('FIREBASE_CLIENT_EMAIL', '')
     if _fb_private_key and _fb_client_email:
-        # Render sometimes converts literal \n to actual newlines; handle both
-        _fb_private_key = _fb_private_key.replace('\\n', '\n')
+        # Normalize the key: handle literal \n, Windows CRLF, and strip extra whitespace
+        _fb_private_key = _fb_private_key.replace('\\n', '\n')   # literal \n → newline
+        _fb_private_key = _fb_private_key.replace('\r\n', '\n')  # CRLF → LF
+        _fb_private_key = _fb_private_key.replace('\r', '\n')    # stray CR → LF
+        _fb_private_key = _fb_private_key.strip()                # remove leading/trailing whitespace
+        # Ensure it ends with a newline (PEM requirement)
+        if not _fb_private_key.endswith('\n'):
+            _fb_private_key += '\n'
         _cred_dict = {
             "type": "service_account",
             "project_id": os.environ.get('FIREBASE_PROJECT_ID', 'phantomtrace-ce048'),
