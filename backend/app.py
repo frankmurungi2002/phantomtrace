@@ -399,6 +399,181 @@ def device_alert():
     print(f"Auto-alert for {device_id}: {title} — {body}")
     return jsonify({'message': 'Alert dispatched'}), 200
 
+# ── T3: police-ready recovery report (PDF) ────────────────────────────────────
+@app.route('/api/device/<device_id>/report', methods=['GET'])
+@jwt_required()
+def recovery_report(device_id):
+    device = Device.query.filter_by(id=device_id, user_id=get_jwt_identity()).first()
+    if not device:
+        return jsonify({'error': 'Device not found'}), 404
+    pdf = build_recovery_pdf(device_id, device)
+    fname = f"PhantomTrace_Report_{(device.device_name or 'device').replace(' ', '_')}.pdf"
+    return send_file(pdf, mimetype='application/pdf',
+                     as_attachment=True, download_name=fname)
+
+
+def build_recovery_pdf(device_id, device):
+    """Assemble a recovery report PDF from everything we know about the device."""
+    import io, requests as _rq
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Table,
+                                    TableStyle, Image as RLImage)
+
+    owner = User.query.filter_by(id=device.user_id).first()
+    loc = db.session.execute(
+        db.text("SELECT * FROM device_location WHERE device_id=:id"),
+        {"id": device_id}).mappings().first()
+    sysinfo = db.session.execute(
+        db.text("SELECT * FROM device_system_info WHERE device_id=:id"),
+        {"id": device_id}).mappings().first()
+    netinfo = db.session.execute(
+        db.text("SELECT * FROM device_network_info WHERE device_id=:id"),
+        {"id": device_id}).mappings().first()
+    photos = EvidencePhoto.query.filter_by(device_id=device_id)\
+        .order_by(EvidencePhoto.timestamp.desc()).limit(6).all()
+    sightings = Sighting.query.filter_by(device_id=device_id)\
+        .order_by(Sighting.timestamp.desc()).limit(30).all()
+
+    styles = getSampleStyleSheet()
+    h1 = ParagraphStyle('h1', parent=styles['Title'], fontSize=20, spaceAfter=2)
+    sub = ParagraphStyle('sub', parent=styles['Normal'], fontSize=9,
+                         textColor=colors.grey)
+    h2 = ParagraphStyle('h2', parent=styles['Heading2'], fontSize=13,
+                        textColor=colors.HexColor('#1F2937'), spaceBefore=14, spaceAfter=6)
+    normal = styles['Normal']
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4,
+                            leftMargin=18*mm, rightMargin=18*mm,
+                            topMargin=16*mm, bottomMargin=16*mm)
+    story = []
+
+    def kv_table(rows):
+        t = Table([[Paragraph(f"<b>{k}</b>", normal), Paragraph(str(v), normal)]
+                   for k, v in rows], colWidths=[55*mm, 110*mm])
+        t.setStyle(TableStyle([
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+            ('LINEBELOW', (0, 0), (-1, -1), 0.25, colors.HexColor('#E5E7EB')),
+        ]))
+        return t
+
+    # Header
+    story.append(Paragraph("PhantomTrace", h1))
+    story.append(Paragraph("Device Recovery Report", sub))
+    story.append(Paragraph(
+        f"Generated {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}", sub))
+    story.append(Spacer(1, 8))
+    status_color = '#EF4444' if device.status == 'STOLEN' else '#22C55E'
+    story.append(Paragraph(
+        f'<font color="{status_color}"><b>STATUS: {device.status}</b></font>', normal))
+
+    # Owner
+    story.append(Paragraph("Registered Owner", h2))
+    story.append(kv_table([
+        ("Name", owner.name if owner else "—"),
+        ("Email", owner.email if owner else "—"),
+        ("Phone", owner.phone if owner else "—"),
+    ]))
+
+    # Device
+    story.append(Paragraph("Device", h2))
+    story.append(kv_table([
+        ("Device name", device.device_name),
+        ("Device ID", device.id),
+        ("Beacon ID", device.beacon_id),
+        ("Registered", device.registered_at.strftime('%Y-%m-%d %H:%M') if device.registered_at else "—"),
+        ("Marked stolen", device.stolen_at.strftime('%Y-%m-%d %H:%M') if device.stolen_at else "—"),
+        ("Last seen", device.last_seen.strftime('%Y-%m-%d %H:%M') if device.last_seen else "—"),
+    ]))
+
+    # System + network
+    if sysinfo or netinfo:
+        story.append(Paragraph("System & Network", h2))
+        rows = []
+        if sysinfo:
+            rows += [("Hostname", sysinfo.get('hostname', '—')),
+                     ("Username", sysinfo.get('username', '—')),
+                     ("OS", f"{sysinfo.get('os_name','')} {sysinfo.get('os_version','')}".strip() or '—')]
+        if netinfo:
+            rows += [("IP address", netinfo.get('ip_address', '—')),
+                     ("MAC address", netinfo.get('mac_address', '—'))]
+        story.append(kv_table(rows))
+
+    # Last known location
+    if loc:
+        story.append(Paragraph("Last Known Location", h2))
+        lat, lng = loc.get('latitude'), loc.get('longitude')
+        maps = f"https://www.google.com/maps?q={lat},{lng}" if lat and lng else "—"
+        story.append(kv_table([
+            ("Coordinates", f"{lat}, {lng}" if lat and lng else "—"),
+            ("Area", loc.get('area') or "—"),
+            ("City", loc.get('city') or "—"),
+            ("Country", loc.get('country') or "—"),
+            ("ISP", loc.get('isp') or "—"),
+            ("IP at location", loc.get('ip_address') or "—"),
+            ("Updated", str(loc.get('updated_at') or "—")),
+            ("Map link", f'<link href="{maps}"><font color="#3B82F6">{maps}</font></link>'),
+        ]))
+
+    # Location history
+    if sightings:
+        story.append(Paragraph("Location History", h2))
+        data = [["Timestamp (UTC)", "Latitude", "Longitude", "Method"]]
+        for s in sightings:
+            data.append([
+                s.timestamp.strftime('%Y-%m-%d %H:%M') if s.timestamp else "—",
+                f"{s.latitude:.5f}" if s.latitude is not None else "—",
+                f"{s.longitude:.5f}" if s.longitude is not None else "—",
+                s.method or "—",
+            ])
+        t = Table(data, colWidths=[45*mm, 40*mm, 40*mm, 30*mm])
+        t.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#111827')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('FONTSIZE', (0, 0), (-1, -1), 8),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#F3F4F6')]),
+            ('GRID', (0, 0), (-1, -1), 0.25, colors.HexColor('#E5E7EB')),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+            ('TOPPADDING', (0, 0), (-1, -1), 4),
+        ]))
+        story.append(t)
+
+    # Evidence photos (embedded from Cloudinary)
+    if photos:
+        story.append(Paragraph("Evidence", h2))
+        for p in photos:
+            try:
+                r = _rq.get(p.file_path, timeout=12)
+                if r.status_code == 200:
+                    img = RLImage(io.BytesIO(r.content))
+                    # scale to max 80mm wide, keep aspect
+                    iw, ih = img.imageWidth, img.imageHeight
+                    max_w = 80*mm
+                    if iw > max_w:
+                        img.drawHeight = ih * (max_w / iw)
+                        img.drawWidth = max_w
+                    cap = f"{p.photo_type} — {p.timestamp.strftime('%Y-%m-%d %H:%M') if p.timestamp else ''}"
+                    story.append(Paragraph(cap, sub))
+                    story.append(img)
+                    story.append(Spacer(1, 8))
+            except Exception as _ie:
+                story.append(Paragraph(
+                    f"[evidence unavailable: {p.photo_type}]", sub))
+
+    story.append(Spacer(1, 16))
+    story.append(Paragraph(
+        "This report was generated by PhantomTrace, an anti-theft and recovery "
+        "platform. The information above is provided by the registered owner to "
+        "assist in recovering a lost or stolen device.", sub))
+
+    doc.build(story)
+    buf.seek(0)
+    return buf
+
 @app.route('/api/sighting/bluetooth', methods=['POST'])
 def bluetooth_sighting():
     data = request.get_json()
