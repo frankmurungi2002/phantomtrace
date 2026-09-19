@@ -133,6 +133,8 @@ class Device(db.Model):
     home_lat = db.Column(db.Float)
     home_lng = db.Column(db.Float)
     geofence_radius = db.Column(db.Float)  # metres
+    # T5 data vault — key the agent uses to encrypt/decrypt the owner's folders
+    vault_key = db.Column(db.Text)
 
 class Sighting(db.Model):
     __tablename__ = 'sightings'
@@ -148,8 +150,11 @@ class Command(db.Model):
     __tablename__ = 'commands'
     id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     device_id = db.Column(db.String(36), db.ForeignKey('devices.id'), nullable=False)
-    command_type = db.Column(db.String(20), nullable=False)
+    command_type = db.Column(db.String(30), nullable=False)
     status = db.Column(db.String(10), default='PENDING')
+    # T4: JSON payload for commands that carry data (e.g. DETERRENT_LOCK
+    # carries the owner's custom message + a one-time unlock code)
+    payload = db.Column(db.Text)
     issued_at = db.Column(db.DateTime, default=datetime.utcnow)
     executed_at = db.Column(db.DateTime)
 
@@ -399,7 +404,23 @@ def agent_config(device_id):
         'home_lat': device.home_lat,
         'home_lng': device.home_lng,
         'geofence_radius': device.geofence_radius,
+        'vault_key': device.vault_key,
     }), 200
+
+# ── T5: agent stores the vault key it generated (so the owner can restore) ─────
+@app.route('/api/device/vault-key', methods=['POST'])
+def store_vault_key():
+    data = request.get_json() or {}
+    device_id = data.get('device_id')
+    key = data.get('key')
+    if not device_id or not key:
+        return jsonify({'error': 'Missing device_id or key'}), 400
+    device = Device.query.filter_by(id=device_id).first()
+    if not device:
+        return jsonify({'error': 'Device not found'}), 404
+    device.vault_key = key
+    db.session.commit()
+    return jsonify({'message': 'Vault key stored'}), 200
 
 # ── T2: agent reports an automatic trigger → push to the owner ────────────────
 @app.route('/api/device/alert', methods=['POST'])
@@ -732,24 +753,83 @@ def device_processes():
     db.session.commit()
     return jsonify({"message":"Processes saved"}), 200
 
+_ALLOWED_COMMANDS = {
+    'LOCK','PHOTO','ALARM','AUDIO','WIPE','SYSTEM_INFO','GET_NETWORK',
+    'GET_DISKS','GET_PROCESSES','SCREENSHOT','GET_LOCATION','STOP_ALARM',
+    'SECURE_DATA','RESTORE_DATA',
+    'DETERRENT_LOCK','UNLOCK_DETERRENT',   # T4
+}
+
 @app.route('/api/command/send', methods=['POST'])
 @jwt_required()
 def send_command():
-    data = request.get_json()
-    if not data or not all(k in data for k in ['device_id','command_type']):
+    data = request.get_json() or {}
+    if not all(k in data for k in ['device_id','command_type']):
         return jsonify({'error': 'Missing fields'}), 400
-    if data['command_type'] not in ['LOCK','PHOTO','ALARM','AUDIO','WIPE','SYSTEM_INFO','GET_NETWORK','GET_DISKS','GET_PROCESSES','SCREENSHOT','GET_LOCATION','STOP_ALARM']:
+    if data['command_type'] not in _ALLOWED_COMMANDS:
         return jsonify({'error': 'Invalid command'}), 400
-    command = Command(device_id=data['device_id'], command_type=data['command_type'])
+
+    # T4: optional payload for commands that carry data
+    payload_text = None
+    payload = data.get('payload')
+    if payload is not None:
+        try:
+            payload_text = _json.dumps(payload) if not isinstance(payload, str) else payload
+        except Exception:
+            payload_text = None
+
+    command = Command(device_id=data['device_id'],
+                      command_type=data['command_type'],
+                      payload=payload_text)
     db.session.add(command)
     db.session.commit()
-    cmd_type = data['command_type']
     return jsonify({'message': 'Command queued', 'command_id': command.id}), 201
+
 
 @app.route('/api/command/pending/<device_id>', methods=['GET'])
 def get_pending(device_id):
     commands = Command.query.filter_by(device_id=device_id, status='PENDING').all()
-    return jsonify({'commands': [{'id': c.id, 'command_type': c.command_type} for c in commands]}), 200
+    out = []
+    for c in commands:
+        row = {'id': c.id, 'command_type': c.command_type}
+        if c.payload:
+            try:
+                row['payload'] = _json.loads(c.payload)
+            except Exception:
+                row['payload'] = c.payload
+        out.append(row)
+    return jsonify({'commands': out}), 200
+
+
+# T4: convenience endpoint for the mobile app. Takes the owner's message and
+# either a supplied unlock_code or auto-generates one; returns the code so the
+# app can show it to the owner ("your unlock code is 4829").
+@app.route('/api/device/deterrent-lock', methods=['POST'])
+@jwt_required()
+def deterrent_lock_endpoint():
+    import random, string
+    data = request.get_json() or {}
+    device_id = data.get('device_id')
+    if not device_id:
+        return jsonify({'error': 'device_id required'}), 400
+    message = (data.get('message') or '').strip()
+    if not message:
+        return jsonify({'error': 'message required'}), 400
+    unlock_code = str(data.get('unlock_code') or '').strip()
+    if not unlock_code:
+        unlock_code = ''.join(random.choices(string.digits, k=6))
+
+    payload = {'message': message, 'unlock_code': unlock_code}
+    cmd = Command(device_id=device_id,
+                  command_type='DETERRENT_LOCK',
+                  payload=_json.dumps(payload))
+    db.session.add(cmd)
+    db.session.commit()
+    return jsonify({
+        'message':    'Deterrent lock queued',
+        'command_id': cmd.id,
+        'unlock_code': unlock_code,   # shown to owner in the app
+    }), 201
 
 @app.route('/api/command/acknowledge/<command_id>', methods=['POST'])
 def acknowledge(command_id):
@@ -918,6 +998,8 @@ def command_result():
             'AUDIO':       ('Audio recorded',      f'Audio evidence recorded from {dname}'),
             'GET_LOCATION':('Location updated',    f'New location received from {dname}'),
             'WIPE':        ('Wipe completed',      f'Data wipe completed on {dname}'),
+            'SECURE_DATA': ('Data protected',      f'Your files on {dname} are now encrypted'),
+            'RESTORE_DATA':('Data restored',       f'Your files on {dname} have been decrypted'),
         }
         title, body = labels.get(ctype, (f'{ctype} completed', f'{ctype} finished on {dname}'))
         notify_device_owner(dev_id, title, body, {'device_id': str(dev_id), 'command_type': str(ctype)})
@@ -957,10 +1039,11 @@ with app.app_context():
     except Exception as _mig_err:
         db.session.rollback()
         print(f"Migration warning (fcm_token): {_mig_err}")
-    # T2: geofence columns on devices
+    # T2/T5: geofence + vault columns on devices
     for _col in ("home_lat DOUBLE PRECISION",
                  "home_lng DOUBLE PRECISION",
-                 "geofence_radius DOUBLE PRECISION"):
+                 "geofence_radius DOUBLE PRECISION",
+                 "vault_key TEXT"):
         try:
             db.session.execute(db.text(
                 f"ALTER TABLE devices ADD COLUMN IF NOT EXISTS {_col}"
@@ -983,6 +1066,23 @@ with app.app_context():
             db.session.rollback()
             print(f"Migration warning (location_history {_col}): {_mig_err3}")
     print("Migration: location_history columns ensured")
+
+    # T4: payload column on commands + widen command_type for DETERRENT_LOCK
+    try:
+        db.session.execute(db.text(
+            "ALTER TABLE commands ADD COLUMN IF NOT EXISTS payload TEXT"))
+        db.session.commit()
+    except Exception as _mig_err4:
+        db.session.rollback()
+        print(f"Migration warning (commands.payload): {_mig_err4}")
+    try:
+        db.session.execute(db.text(
+            "ALTER TABLE commands ALTER COLUMN command_type TYPE VARCHAR(30)"))
+        db.session.commit()
+    except Exception as _mig_err5:
+        db.session.rollback()
+        print(f"Migration warning (commands.command_type widen): {_mig_err5}")
+    print("Migration: commands.payload + widened command_type ensured")
 
 
 @app.route('/api/device/self-register', methods=['POST'])

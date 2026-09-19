@@ -5,7 +5,8 @@ Runs silently on a protected laptop. On first launch it self-registers with
 the backend, then polls for commands every 3 seconds and sends heartbeats.
 
 Supports: LOCK, ALARM, STOP_ALARM, PHOTO, SCREENSHOT, AUDIO, WIPE,
-          PING, SYSTEM_INFO, GET_NETWORK, GET_DISKS, GET_PROCESSES, GET_LOCATION
+          PING, SYSTEM_INFO, GET_NETWORK, GET_DISKS, GET_PROCESSES, GET_LOCATION,
+          SECURE_DATA, RESTORE_DATA, DETERRENT_LOCK, UNLOCK_DETERRENT
 """
 
 import subprocess, sys, platform as _platform_check, os
@@ -28,12 +29,17 @@ def _can_import(mod):
     try: importlib.import_module(mod); return True
     except ImportError: return False
 
-_ensure_dependencies()
+if not getattr(sys, 'frozen', False):
+    _ensure_dependencies()   # bundled deps in the .exe; only install when running as .py
 
 import requests, time, platform, socket, getpass, uuid, shutil, json, math, signal, threading
 
 IS_WINDOWS = platform.system() == "Windows"
 IS_LINUX   = platform.system() == "Linux"
+
+# Run all helper processes (powershell, netsh, tasklist, taskkill, ffmpeg...)
+# WITHOUT flashing a console window on Windows.
+NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
 
 # ── Persistence layer (T1) ──────────────────────────────────────────────────
 # Ensure the agent's own folder is importable, then load persistence helpers.
@@ -54,6 +60,22 @@ try:
 except Exception as _te0:
     _HAS_TRIGGERS = False
     print(f"Triggers layer unavailable: {_te0}")
+
+# ── Data vault (T5) ──────────────────────────────────────────────────────────
+try:
+    import datavault
+    _HAS_VAULT = True
+except Exception as _ve0:
+    _HAS_VAULT = False
+    print(f"Data vault unavailable: {_ve0}")
+
+# ── Deterrent lock overlay (T4) ─────────────────────────────────────────────
+try:
+    import deterrent_lock
+    _HAS_DETERRENT = True
+except Exception as _de0:
+    _HAS_DETERRENT = False
+    print(f"Deterrent lock unavailable: {_de0}")
 
 if getattr(sys, 'frozen', False):
     CONFIG_FILE = os.path.join(os.path.dirname(sys.executable), 'device.json')
@@ -123,7 +145,7 @@ def send_disk_info(device_id):
 def send_process_info(device_id):
     try:
         if IS_WINDOWS:
-            out = subprocess.check_output(["tasklist","/FO","CSV","/NH"], text=True, errors="ignore")
+            out = subprocess.check_output(["tasklist","/FO","CSV","/NH"], text=True, errors="ignore", creationflags=NO_WINDOW)
             procs = list({line.split('","')[0].strip('"') for line in out.splitlines() if line.strip()})[:100]
         else:
             out = subprocess.check_output(["ps","-eo","comm"], text=True)
@@ -134,31 +156,298 @@ def send_process_info(device_id):
     except Exception as e:
         print(f"process_info error: {e}")
 
+# ── Location consent + keep-on ────────────────────────────────────────────────
+# With the owner's consent, PhantomTrace keeps Windows Location ON so a forgotten
+# toggle can't defeat recovery. It asks ONCE; enabling the platform needs admin.
+_REG_PT = r"Software\PhantomTrace"
+
+def _loc_consent_get():
+    if not IS_WINDOWS:
+        return None
+    try:
+        import winreg
+        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _REG_PT)
+        val, _ = winreg.QueryValueEx(k, "location_consent")
+        winreg.CloseKey(k)
+        return val
+    except Exception:
+        return None
+
+def _loc_consent_set(v):
+    try:
+        import winreg
+        k = winreg.CreateKey(winreg.HKEY_CURRENT_USER, _REG_PT)
+        winreg.SetValueEx(k, "location_consent", 0, winreg.REG_SZ, v)
+        winreg.CloseKey(k)
+    except Exception as e:
+        print(f"consent store failed: {e}")
+
+def _loc_prompt_consent():
+    """Ask the owner (once) to allow always-on location. Returns True if allowed."""
+    try:
+        import ctypes
+        MB_YESNO, MB_ICONQUESTION, IDYES = 0x4, 0x20, 6
+        msg = ("PhantomTrace can keep Location turned ON so this laptop can be located "
+               "if it is ever lost or stolen — even if you forget to switch it on.\n\n"
+               "Allow PhantomTrace to keep Location enabled on this device?")
+        r = ctypes.windll.user32.MessageBoxW(0, msg, "PhantomTrace - Location Permission",
+                                             MB_YESNO | MB_ICONQUESTION)
+        return r == IDYES
+    except Exception as e:
+        print(f"consent prompt failed: {e}")
+        return False
+
+def _loc_is_enabled():
+    if not IS_WINDOWS:
+        return True
+    try:
+        import winreg
+        k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location")
+        val, _ = winreg.QueryValueEx(k, "Value")
+        winreg.CloseKey(k)
+        return val == "Allow"
+    except Exception:
+        return False
+
+def _loc_enable_registry():
+    """Turn on the location platform + app/desktop access. Needs admin; silent."""
+    ok = False
+    try:
+        import winreg
+        for path in (
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location",
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location\NonPackaged",
+        ):
+            try:
+                k = winreg.CreateKey(winreg.HKEY_LOCAL_MACHINE, path)
+                winreg.SetValueEx(k, "Value", 0, winreg.REG_SZ, "Allow")
+                winreg.CloseKey(k); ok = True
+            except Exception as e:
+                print(f"loc consent reg failed ({path}): {e}")
+        try:
+            k = winreg.CreateKey(winreg.HKEY_LOCAL_MACHINE,
+                r"SYSTEM\CurrentControlSet\Services\lfsvc\Service\Configuration")
+            winreg.SetValueEx(k, "Status", 0, winreg.REG_DWORD, 1)
+            winreg.CloseKey(k); ok = True
+        except Exception as e:
+            print(f"loc platform status failed: {e}")
+    except Exception as e:
+        print(f"enable location failed: {e}")
+    return ok
+
+_loc_settings_opened = False
+
+def ensure_location(startup=False):
+    """Consent once, then keep Windows Location enabled for the owner."""
+    global _loc_settings_opened
+    if not IS_WINDOWS:
+        return
+    consent = _loc_consent_get()
+    if consent is None and startup:
+        granted = _loc_prompt_consent()
+        consent = "yes" if granted else "no"
+        _loc_consent_set(consent)
+        print(f"Location consent: {consent}")
+    if consent != "yes":
+        return
+    if _loc_is_enabled():
+        return
+    if _loc_enable_registry():
+        print("Location: enabled by PhantomTrace")
+    elif startup and not _loc_settings_opened:
+        # Not elevated — open the settings page once so the owner flips it
+        _loc_settings_opened = True
+        try:
+            os.system("start ms-settings:privacy-location")
+            print("Location: opened Windows settings for the owner to enable")
+        except Exception:
+            pass
+
+
+# Cache so we don't spawn PowerShell on every call
+_loc_cache = {"lat": None, "lon": None, "acc": None, "src": None, "ts": 0}
+
+# Set this to your Google API key (Geolocation API enabled) for accurate Wi-Fi
+# positioning. Read from env var so it isn't hard-coded in the repo.
+GOOGLE_GEOLOCATION_KEY = os.getenv("GOOGLE_GEOLOCATION_KEY", "")
+
+
+def _wifi_scan():
+    """Nearby Wi-Fi access points as [{macAddress, signalStrength(dBm)}] (Windows)."""
+    aps = []
+    if not IS_WINDOWS:
+        return aps
+    try:
+        out = subprocess.run(["netsh", "wlan", "show", "networks", "mode=bssid"],
+                             capture_output=True, text=True, timeout=15,
+                             creationflags=NO_WINDOW).stdout or ""
+        cur = None
+        for line in out.splitlines():
+            s = line.strip()
+            low = s.lower()
+            if low.startswith("bssid") and ":" in s:
+                mac = s.split(":", 1)[1].strip()
+                cur = {"macAddress": mac}
+            elif low.startswith("signal") and cur is not None and "%" in s:
+                try:
+                    pct = int(s.split(":", 1)[1].strip().replace("%", ""))
+                    cur["signalStrength"] = int(pct / 2) - 100  # % -> approx dBm
+                    aps.append(cur)
+                except Exception:
+                    pass
+                cur = None
+    except Exception as e:
+        print(f"wifi scan failed: {e}")
+    return aps
+
+
+def get_wifi_location_google():
+    """Accurate device location from nearby Wi-Fi via Google Geolocation API."""
+    if not GOOGLE_GEOLOCATION_KEY:
+        return None, None, None
+    aps = _wifi_scan()
+    try:
+        payload = {"considerIp": True}
+        if len(aps) >= 2:
+            payload["wifiAccessPoints"] = aps
+        r = requests.post(
+            f"https://www.googleapis.com/geolocation/v1/geolocate?key={GOOGLE_GEOLOCATION_KEY}",
+            json=payload, timeout=12)
+        if r.status_code == 200:
+            d = r.json()
+            loc = d.get("location", {})
+            return loc.get("lat"), loc.get("lng"), d.get("accuracy")
+        print(f"google geolocate {r.status_code}: {r.text[:120]}")
+    except Exception as e:
+        print(f"google geolocate failed: {e}")
+    return None, None, None
+
+
+def get_windows_location():
+    """Device location via Windows Location Service (falls back to IP internally)."""
+    if not IS_WINDOWS:
+        return None, None, None
+    try:
+        ps = (
+            "Add-Type -AssemblyName System.Device;"
+            "$w=New-Object System.Device.Location.GeoCoordinateWatcher;"
+            "$w.Start();"
+            "$n=0; while(($w.Status -ne [System.Device.Location.GeoPositionStatus]::Ready) "
+            "-and ($n -lt 30)){Start-Sleep -Milliseconds 400; $n++};"
+            "$c=$w.Position.Location;"
+            "if($c.IsUnknown){'UNKNOWN'} else "
+            "{'{0},{1},{2}' -f $c.Latitude,$c.Longitude,$c.HorizontalAccuracy};"
+            "$w.Stop()"
+        )
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+            capture_output=True, text=True, timeout=30, creationflags=NO_WINDOW)
+        val = (out.stdout or "").strip().splitlines()[-1].strip() if out.stdout else ""
+        if val and val != "UNKNOWN" and "," in val:
+            parts = val.split(",")
+            acc = float(parts[2]) if len(parts) > 2 and parts[2] else None
+            return float(parts[0]), float(parts[1]), acc
+    except Exception as e:
+        print(f"windows location failed: {e}")
+    return None, None, None
+
+
+def get_precise_location(max_age=60):
+    """
+    Best available device location, in priority order:
+      1. Google Geolocation (Wi-Fi scan)  — best coverage in East Africa
+      2. Windows Location Service          — Wi-Fi/IP, coverage-dependent
+    Returns (lat, lon, accuracy_m); sets _loc_cache['src'] to the method used.
+    """
+    if _loc_cache["lat"] is not None and (time.time() - _loc_cache["ts"] < max_age):
+        return _loc_cache["lat"], _loc_cache["lon"], _loc_cache["acc"]
+    lat, lon, acc, src = None, None, None, None
+    g_lat, g_lon, g_acc = get_wifi_location_google()
+    if g_lat is not None:
+        lat, lon, acc, src = g_lat, g_lon, g_acc, "WIFI-GOOGLE"
+    else:
+        w_lat, w_lon, w_acc = get_windows_location()
+        if w_lat is not None:
+            lat, lon, acc, src = w_lat, w_lon, w_acc, "WIN-LOC"
+    if lat is not None:
+        _loc_cache.update({"lat": lat, "lon": lon, "acc": acc, "src": src, "ts": time.time()})
+        return lat, lon, acc
+    return None, None, None
+
+
+def secure_data(device_id):
+    """Encrypt the owner's vault folders; generate + register a key if needed."""
+    if not _HAS_VAULT:
+        print("Data vault unavailable"); return
+    try:
+        cfg = triggers.fetch_config(device_id) if _HAS_TRIGGERS else {}
+        key = cfg.get("vault_key")
+        if not key:
+            key = datavault.new_key()
+            requests.post(f"{BASE_URL}/api/device/vault-key",
+                          json={"device_id": device_id, "key": key}, timeout=10)
+            print("Vault: generated and registered new key")
+        n = datavault.protect(key)
+        print(f"Vault: encrypted {n} file(s)")
+    except Exception as e:
+        print(f"secure_data error: {e}")
+
+def restore_data(device_id):
+    """Decrypt the owner's vault folders using the stored key."""
+    if not _HAS_VAULT:
+        print("Data vault unavailable"); return
+    try:
+        cfg = triggers.fetch_config(device_id) if _HAS_TRIGGERS else {}
+        key = cfg.get("vault_key")
+        if not key:
+            print("Vault: no key on record — nothing to restore"); return
+        n = datavault.restore(key)
+        print(f"Vault: decrypted {n} file(s)")
+    except Exception as e:
+        print(f"restore_data error: {e}")
+
+
 def send_location(device_id):
     try:
-        geo = requests.get(
-            "http://ip-api.com/json/?fields=lat,lon,city,regionName,country,isp,query,zip,district",
-            timeout=8).json()
-        lat, lon = geo.get("lat"), geo.get("lon")
-        area = geo.get("district") or geo.get("regionName") or ""
+        # ISP/IP lookup gives city / country / ISP / public IP (network context)
+        geo = {}
         try:
-            nom = requests.get(
-                f"https://nominatim.openstreetmap.org/reverse?lat={lat}&lon={lon}&format=json&addressdetails=1",
-                headers={"User-Agent": "PhantomTrace/1.0"}, timeout=6).json()
-            addr = nom.get("address", {})
-            area = (addr.get("suburb") or addr.get("neighbourhood") or addr.get("quarter")
-                    or addr.get("city_district") or addr.get("district")
-                    or addr.get("county") or geo.get("regionName") or "")
-        except Exception as ne:
-            print(f"Nominatim fallback: {ne}")
+            geo = requests.get(
+                "http://ip-api.com/json/?fields=lat,lon,city,regionName,country,isp,query,zip,district",
+                timeout=8).json()
+        except Exception as ge:
+            print(f"ip geo failed: {ge}")
+
+        # Prefer the REAL device location; fall back to ISP coordinates
+        plat, plon, pacc = get_precise_location()
+        if plat is not None:
+            lat, lon, source = plat, plon, (_loc_cache.get("src") or "DEVICE")
+        else:
+            lat, lon, source = geo.get("lat"), geo.get("lon"), "ISP"
+
+        area = geo.get("district") or geo.get("regionName") or ""
+        if lat is not None and lon is not None:
+            try:
+                nom = requests.get(
+                    f"https://nominatim.openstreetmap.org/reverse?lat={lat}&lon={lon}&format=json&addressdetails=1",
+                    headers={"User-Agent": "PhantomTrace/1.0"}, timeout=6).json()
+                addr = nom.get("address", {})
+                area = (addr.get("suburb") or addr.get("neighbourhood") or addr.get("quarter")
+                        or addr.get("city_district") or addr.get("district")
+                        or addr.get("county") or geo.get("regionName") or "")
+            except Exception as ne:
+                print(f"Nominatim fallback: {ne}")
         city    = geo.get("city", "")
         country = geo.get("country", "")
         full_area = f"{area}, {city}" if area and area != city else city
         r = requests.post(f"{BASE_URL}/api/device/location",
             json={"device_id": device_id, "latitude": lat, "longitude": lon,
                   "city": city, "country": country, "isp": geo.get("isp"),
-                  "ip_address": geo.get("query"), "area": full_area}, timeout=10)
-        print(f"LOCATION: {r.status_code} — {full_area}, {country}")
+                  "ip_address": geo.get("query"), "area": full_area,
+                  "source": source, "accuracy": pacc}, timeout=10)
+        acc_txt = f" ~{int(pacc)}m" if pacc else ""
+        print(f"LOCATION [{source}{acc_txt}]: {r.status_code} — {full_area}, {country}")
     except Exception as e:
         print(f"location error: {e}")
 
@@ -198,7 +487,7 @@ for ($i=0; $i -lt 30; $i++) { [console]::beep(1000+($i*50), 200) }
 """
                 for _ in range(5):
                     if not _alarm_active: break
-                    subprocess.run(["powershell","-Command", ps_script], capture_output=True, timeout=10)
+                    subprocess.run(["powershell","-Command", ps_script], capture_output=True, timeout=10, creationflags=NO_WINDOW)
             else:
                 # Linux: use ffmpeg to generate a siren wav then play it
                 alarm_file = "/tmp/pt_alarm.wav"
@@ -226,8 +515,8 @@ def stop_alarm():
     global _alarm_active
     _alarm_active = False
     if IS_WINDOWS:
-        subprocess.run(["taskkill", "/F", "/IM", "ffplay.exe"],  check=False, capture_output=True)
-        subprocess.run(["taskkill", "/F", "/IM", "ffplay_g.exe"],check=False, capture_output=True)
+        subprocess.run(["taskkill", "/F", "/IM", "ffplay.exe"],  check=False, capture_output=True, creationflags=NO_WINDOW)
+        subprocess.run(["taskkill", "/F", "/IM", "ffplay_g.exe"],check=False, capture_output=True, creationflags=NO_WINDOW)
     else:
         subprocess.run(["pkill","-f","ffplay"], check=False)
         subprocess.run(["pkill","-f","aplay"],  check=False)
@@ -290,11 +579,11 @@ def record_audio(device_id, duration=30):
             result = subprocess.run([
                 "ffmpeg","-y","-f","dshow","-i","audio=Microphone Array (Realtek)",
                 "-t", str(duration), tmp
-            ], capture_output=True, timeout=duration+15)
+            ], capture_output=True, timeout=duration+15, creationflags=NO_WINDOW)
             if result.returncode != 0:
                 # Fallback: list devices and use first available
                 subprocess.run(["ffmpeg","-y","-f","dshow","-i","audio=Microphone",
-                    "-t", str(duration), tmp], capture_output=True, timeout=duration+15)
+                    "-t", str(duration), tmp], capture_output=True, timeout=duration+15, creationflags=NO_WINDOW)
         else:
             subprocess.run(["ffmpeg","-y","-f","alsa","-i","default",
                 "-t", str(duration), tmp], capture_output=True, timeout=duration+15)
@@ -349,6 +638,38 @@ def send_evidence(device_id, filename, photo_type):
 def on_shutdown_signal(device_id, signum=None, frame=None):
     """Called when OS signals shutdown / reboot / Ctrl+C."""
     print(f"Shutdown signal received ({signum})")
+
+    # T-SHUTDOWN: if the device is under deterrent lock, actively block the
+    # shutdown regardless of what the backend says. The overlay + registry
+    # already hid the Power button, but a scripted `shutdown /s` still
+    # reaches us here — abort it.
+    locally_locked = False
+    if _HAS_DETERRENT:
+        try:
+            locally_locked = deterrent_lock.is_locked()
+        except Exception:
+            pass
+
+    if locally_locked and IS_WINDOWS:
+        try:
+            import ctypes
+            ctypes.windll.advapi32.AbortSystemShutdownW(None)
+            print("Shutdown BLOCKED — device is under PhantomTrace deterrent lock")
+        except Exception as e:
+            print(f"AbortSystemShutdown (local) failed: {e}")
+        # Also tell the owner that someone tried to power it off
+        try:
+            requests.post(f"{BASE_URL}/api/device/alert",
+                json={"device_id": device_id,
+                      "title": "Shutdown attempt blocked",
+                      "body":  "Someone tried to shut down your locked device. "
+                               "Location is still active."},
+                timeout=6)
+        except Exception:
+            pass
+        return
+
+    # Otherwise: existing behavior — ask the backend if we should resist
     try:
         r = requests.post(f"{BASE_URL}/api/device/shutdown-alert",
             json={"device_id": device_id, "reason": "SHUTDOWN_SIGNAL"}, timeout=8)
@@ -388,6 +709,13 @@ def setup_shutdown_protection(device_id):
             signal.signal(sig, lambda s, f: on_shutdown_signal(device_id, s, f))
         print("Unix shutdown protection active (SIGTERM/SIGHUP)")
 
+# ── Watchdog mode ────────────────────────────────────────────────────────────
+# Launched as "…--watchdog" (by persistence.ensure_watchdog): run only the
+# watchdog loop, which relaunches the agent if it dies, then exit.
+if _HAS_PERSISTENCE and "--watchdog" in sys.argv:
+    persistence.run_watchdog()
+    sys.exit(0)
+
 # ── Main loop ──────────────────────────────────────────────────────────────────
 print("PhantomTrace Agent starting...")
 
@@ -405,10 +733,19 @@ if _HAS_PERSISTENCE:
     persistence.ensure_watchdog()                    # make sure the watchdog is up
 
 setup_shutdown_protection(DEVICE_ID)
+ensure_location(startup=True)   # ask consent once, then keep Location on
+
+# T4: if the device rebooted while under deterrent lock, put the overlay back
+if _HAS_DETERRENT:
+    try: deterrent_lock.restore_on_boot()
+    except Exception as _re: print(f"deterrent restore failed: {_re}")
+
 auto_report(DEVICE_ID)
 
 AUTO_REPORT_INTERVAL = 60   # seconds between full auto-reports
 last_report = time.time()
+LOCATION_ASSERT_INTERVAL = 300   # re-assert Location every 5 min
+last_loc_assert = time.time()
 
 # ── T2 trigger state ─────────────────────────────────────────────────────────
 TRIGGER_INTERVAL       = 30   # seconds between automatic-trigger checks
@@ -426,6 +763,11 @@ while True:
                 break
             persistence.touch_heartbeat()   # tell the watchdog we're alive
             persistence.ensure_watchdog()   # relaunch the watchdog if it died
+
+        # Keep Location on (silent; only if the owner consented and we're elevated)
+        if time.time() - last_loc_assert >= LOCATION_ASSERT_INTERVAL:
+            last_loc_assert = time.time()
+            ensure_location(startup=False)
 
         # Heartbeat
         hb = requests.post(f"{BASE_URL}/api/device/heartbeat",
@@ -489,6 +831,38 @@ while True:
                 elif ctype == "GET_LOCATION":
                     send_location(DEVICE_ID)
 
+                elif ctype == "SECURE_DATA":
+                    secure_data(DEVICE_ID)
+
+                elif ctype == "RESTORE_DATA":
+                    restore_data(DEVICE_ID)
+
+                elif ctype == "DETERRENT_LOCK":
+                    # T4: full-screen deterrent lock with owner's message.
+                    # The command carries a JSON payload:
+                    #   { "message": "...", "unlock_code": "1234" }
+                    if _HAS_DETERRENT:
+                        try:
+                            payload = cmd.get("payload") or {}
+                            if isinstance(payload, str):
+                                try: payload = json.loads(payload)
+                                except Exception: payload = {}
+                            msg  = payload.get("message", "").strip() \
+                                   or "This device has been reported stolen."
+                            code = str(payload.get("unlock_code", "")).strip() \
+                                   or "0000"
+                            deterrent_lock.activate(msg, DEVICE_ID, code)
+                        except Exception as _de:
+                            print(f"DETERRENT_LOCK failed: {_de}")
+                    else:
+                        print("Deterrent lock module unavailable")
+
+                elif ctype == "UNLOCK_DETERRENT":
+                    if _HAS_DETERRENT:
+                        deterrent_lock.deactivate()
+                    else:
+                        print("Deterrent lock module unavailable")
+
                 # Acknowledge command
                 requests.post(f"{BASE_URL}/api/command/acknowledge/{cid}", timeout=8)
                 requests.post(f"{BASE_URL}/api/command/result",
@@ -505,12 +879,17 @@ while True:
             try:
                 cfg = triggers.fetch_config(DEVICE_ID)
                 status = cfg.get("status", "SAFE")
-                pub_ip, lat, lng = triggers.get_ip_and_location()
+                pub_ip, iplat, iplng = triggers.get_ip_and_location()
+
+                # Prefer the real device location for geofencing; fall back to IP
+                plat, plon, _acc = get_precise_location()
+                lat = plat if plat is not None else iplat
+                lng = plon if plon is not None else iplng
 
                 # 1) new network / public-IP change
                 triggers.check_network_change(DEVICE_ID, pub_ip)
 
-                # 2) left the safe zone
+                # 2) left the safe zone (uses precise location when available)
                 triggers.check_geofence(DEVICE_ID, cfg, lat, lng)
 
                 # 3) repeated failed logins (Windows, best effort)
