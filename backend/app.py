@@ -135,6 +135,8 @@ class Device(db.Model):
     geofence_radius = db.Column(db.Float)  # metres
     # T5 data vault — key the agent uses to encrypt/decrypt the owner's folders
     vault_key = db.Column(db.Text)
+    # T7 offline auto-lock threshold in minutes (agent default = 15)
+    offline_lock_minutes = db.Column(db.Integer)
 
 class Sighting(db.Model):
     __tablename__ = 'sightings'
@@ -405,7 +407,33 @@ def agent_config(device_id):
         'home_lng': device.home_lng,
         'geofence_radius': device.geofence_radius,
         'vault_key': device.vault_key,
+        # T7: offline auto-lock threshold in minutes. Uses column if set,
+        # else the agent falls back to its own default (15 min).
+        'offline_lock_minutes': getattr(device, 'offline_lock_minutes', None),
     }), 200
+
+
+# T7: let the owner tune the offline-auto-lock threshold from the app
+@app.route('/api/device/offline-lock-config', methods=['POST'])
+@jwt_required()
+def set_offline_lock_config():
+    data = request.get_json() or {}
+    device_id = data.get('device_id')
+    minutes   = data.get('minutes')
+    if not device_id or minutes is None:
+        return jsonify({'error': 'device_id and minutes required'}), 400
+    try:
+        minutes = int(minutes)
+    except Exception:
+        return jsonify({'error': 'minutes must be integer'}), 400
+    if minutes < 1 or minutes > 240:
+        return jsonify({'error': 'minutes must be 1..240'}), 400
+    device = Device.query.filter_by(id=device_id).first()
+    if not device:
+        return jsonify({'error': 'Device not found'}), 404
+    device.offline_lock_minutes = minutes
+    db.session.commit()
+    return jsonify({'message': f'Offline-lock threshold set to {minutes} min'}), 200
 
 # ── T5: agent stores the vault key it generated (so the owner can restore) ─────
 @app.route('/api/device/vault-key', methods=['POST'])
@@ -1043,7 +1071,8 @@ with app.app_context():
     for _col in ("home_lat DOUBLE PRECISION",
                  "home_lng DOUBLE PRECISION",
                  "geofence_radius DOUBLE PRECISION",
-                 "vault_key TEXT"):
+                 "vault_key TEXT",
+                 "offline_lock_minutes INTEGER"):   # T7
         try:
             db.session.execute(db.text(
                 f"ALTER TABLE devices ADD COLUMN IF NOT EXISTS {_col}"

@@ -774,6 +774,11 @@ while True:
             json={"device_id": DEVICE_ID}, timeout=8)
         print(f"Heartbeat: {hb.status_code}")
 
+        # T7: record a successful heartbeat so the offline-lock clock resets
+        if _HAS_TRIGGERS and hb.status_code < 500:
+            try: triggers.mark_heartbeat_ok()
+            except Exception: pass
+
         # Auto-report every minute
         if time.time() - last_report >= AUTO_REPORT_INTERVAL:
             auto_report(DEVICE_ID)
@@ -920,6 +925,22 @@ while True:
                         send_location(DEVICE_ID)   # ongoing evidence trail
                 else:
                     _stolen_handled = False
+
+                # 5) T7: offline auto-lock. If the agent has been unable to
+                #    reach the backend for >= threshold minutes, lock the
+                #    workstation locally. Defeats the thief who yanks Wi-Fi.
+                try:
+                    if triggers.check_offline_lock(DEVICE_ID, cfg):
+                        try: lock_device()
+                        except Exception as e: print(f"T7 lock failed: {e}")
+                        # Queue an alert; it will send when connectivity returns
+                        try:
+                            triggers.send_alert(DEVICE_ID, "Offline auto-lock",
+                                "Your device was offline too long and has been "
+                                "locked automatically for safety.")
+                        except Exception: pass
+                except Exception as _oe:
+                    print(f"T7 check error: {_oe}")
             except Exception as _te:
                 print(f"trigger cycle error: {_te}")
 
