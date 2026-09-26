@@ -578,6 +578,43 @@ def _normalize_phone(p):
     return p
 
 
+def _phone_candidates(p):
+    """
+    Return every plausible way this same phone could have been stored at
+    registration time, so we can find the user regardless of format.
+    e.g. '+256712345678', '256712345678', '0712345678', '712345678'.
+    """
+    p = _normalize_phone(p)
+    cands = set([p])
+    if p.startswith("+"):
+        cands.add(p[1:])                         # 256712345678
+    if p.startswith("+256"):
+        cands.add("0" + p[4:])                    # 0712345678
+        cands.add(p[4:])                          # 712345678
+        cands.add(p[1:])                          # 256712345678
+    elif p.startswith("256"):
+        cands.add("+" + p)                        # +256712345678
+        cands.add("0" + p[3:])                    # 0712345678
+        cands.add(p[3:])                          # 712345678
+    elif p.startswith("0") and len(p) == 10:
+        # already normalized above, but just in case
+        cands.add("+256" + p[1:])
+        cands.add("256"  + p[1:])
+        cands.add(p[1:])
+    return [c for c in cands if c]
+
+
+def _find_user_by_phone(p):
+    """Look up a user by phone, trying every equivalent formatting."""
+    cands = _phone_candidates(p)
+    if not cands:
+        return None, None
+    user = User.query.filter(User.phone.in_(cands)).first()
+    if user:
+        return user, user.phone   # return the exact stored form
+    return None, None
+
+
 def _sha(x):
     return _hashlib.sha256(str(x).encode()).hexdigest()
 
