@@ -142,9 +142,14 @@ def check_failed_logins(window_minutes=5):
         ms = window_minutes * 60 * 1000
         q = (f"*[System[(EventID=4625) and "
              f"TimeCreated[timediff(@SystemTime)<={ms}]]]")
+        # CREATE_NO_WINDOW = 0x08000000 — critical to keep this silent.
+        # This runs every 30 seconds from the T2 trigger cycle, so a missing
+        # flag here means a CMD window flashes on the user's screen every
+        # 30 seconds. Always keep NO_WINDOW here.
         r = subprocess.run(
             ["wevtutil", "qe", "Security", f"/q:{q}", "/f:text", "/c:50"],
-            capture_output=True, text=True, timeout=15)
+            capture_output=True, text=True, timeout=15,
+            creationflags=0x08000000)
         if r.returncode != 0:
             return 0
         return r.stdout.count("Event ID:")

@@ -264,7 +264,10 @@ def get_or_register_device():
     print("First launch — showing pairing dialog")
     paired = _pair_via_dialog(device_name)
     if not paired:
-        raise Exception("Pairing cancelled by user. Restart the agent to try again.")
+        # Cancelled — exit cleanly. Raising an exception would surface as
+        # an ugly "Unhandled exception in script" popup on the frozen .exe.
+        print("Pairing cancelled by user. Restart the agent to try again.")
+        sys.exit(0)
     device_id, beacon_id = paired
     with open(CONFIG_FILE, 'w') as f:
         json.dump({"device_id": device_id, "beacon_id": beacon_id}, f)
@@ -414,10 +417,12 @@ def ensure_location(startup=False):
     if _loc_enable_registry():
         print("Location: enabled by PhantomTrace")
     elif startup and not _loc_settings_opened:
-        # Not elevated — open the settings page once so the owner flips it
+        # Not elevated — open the settings page once so the owner flips it.
+        # Use os.startfile (ShellExecute under the hood) instead of os.system,
+        # which would flash a cmd.exe window. Silent = no visible CMD popup.
         _loc_settings_opened = True
         try:
-            os.system("start ms-settings:privacy-location")
+            os.startfile("ms-settings:privacy-location")
             print("Location: opened Windows settings for the owner to enable")
         except Exception:
             pass
