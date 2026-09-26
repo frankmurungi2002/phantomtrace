@@ -6,7 +6,8 @@ the backend, then polls for commands every 3 seconds and sends heartbeats.
 
 Supports: LOCK, ALARM, STOP_ALARM, PHOTO, SCREENSHOT, AUDIO, WIPE,
           PING, SYSTEM_INFO, GET_NETWORK, GET_DISKS, GET_PROCESSES, GET_LOCATION,
-          SECURE_DATA, RESTORE_DATA, DETERRENT_LOCK, UNLOCK_DETERRENT
+          SECURE_DATA, RESTORE_DATA, DETERRENT_LOCK, UNLOCK_DETERRENT,
+          BITLOCKER_STATUS, ENABLE_BITLOCKER, INSTANT_WIPE
 """
 
 import subprocess, sys, platform as _platform_check, os
@@ -76,6 +77,14 @@ try:
 except Exception as _de0:
     _HAS_DETERRENT = False
     print(f"Deterrent lock unavailable: {_de0}")
+
+# ── BitLocker orchestrator (T8) ─────────────────────────────────────────────
+try:
+    import bitlocker
+    _HAS_BITLOCKER = True
+except Exception as _be0:
+    _HAS_BITLOCKER = False
+    print(f"BitLocker module unavailable: {_be0}")
 
 if getattr(sys, 'frozen', False):
     CONFIG_FILE = os.path.join(os.path.dirname(sys.executable), 'device.json')
@@ -408,6 +417,117 @@ def restore_data(device_id):
         print(f"restore_data error: {e}")
 
 
+# ── T8: BitLocker orchestration + instant crypto-erase ────────────────────────
+def report_bitlocker_status(device_id):
+    """Send the current BitLocker status of every volume to the backend."""
+    if not _HAS_BITLOCKER:
+        return
+    try:
+        volumes = bitlocker.status_all()
+        requests.post(f"{BASE_URL}/api/device/bitlocker-status",
+                      json={"device_id": device_id, "volumes": volumes},
+                      timeout=10)
+        for v in volumes:
+            print(f"BitLocker {v['volume']}: {v['protection']} / {v['conversion']}")
+    except Exception as e:
+        print(f"bitlocker status report failed: {e}")
+
+
+def escrow_bitlocker_key(device_id, letter="C:"):
+    """
+    Add PhantomTrace's own recovery-password protector to the given volume
+    and upload the 48-digit recovery key to the backend so the owner can
+    recover data after a wipe or hardware failure. Idempotent.
+    """
+    if not _HAS_BITLOCKER:
+        print("BitLocker module unavailable"); return
+    try:
+        if bitlocker.has_escrowed_key():
+            print("BitLocker: key already escrowed — skipping")
+            return
+        rec = bitlocker.add_recovery_password_protector(letter)
+        if not rec:
+            print(f"BitLocker: could not add recovery protector on {letter}")
+            return
+        r = requests.post(f"{BASE_URL}/api/device/bitlocker-key",
+                          json={"device_id": device_id,
+                                "volume":    letter,
+                                "key_id":    rec["key_id"],
+                                "recovery_key": rec["recovery_key"]},
+                          timeout=15)
+        if r.status_code < 400:
+            bitlocker.mark_escrowed(rec["key_id"])
+            print(f"BitLocker: recovery key escrowed for {letter}")
+        else:
+            print(f"BitLocker key escrow rejected: {r.status_code} {r.text[:120]}")
+    except Exception as e:
+        print(f"escrow_bitlocker_key error: {e}")
+
+
+def enable_bitlocker(device_id, letter="C:"):
+    """Turn BitLocker on for the volume, then escrow the key."""
+    if not _HAS_BITLOCKER:
+        print("BitLocker module unavailable"); return
+    try:
+        st = bitlocker.status_for_volume(letter)
+        if st["protection"] == "On":
+            print(f"BitLocker already ON for {letter}")
+        else:
+            ok = bitlocker.enable(letter)
+            if not ok:
+                triggers.send_alert(device_id, "BitLocker enable failed",
+                    f"Could not turn on BitLocker for {letter} — may need admin.")
+                return
+            print(f"BitLocker enable requested for {letter}")
+        escrow_bitlocker_key(device_id, letter)
+        report_bitlocker_status(device_id)
+    except Exception as e:
+        print(f"enable_bitlocker error: {e}")
+
+
+def instant_wipe(device_id):
+    """
+    The INSTANT_WIPE command. Crypto-erase the system volume by deleting
+    every BitLocker key protector, then reboot. After this, the drive is
+    unreadable unless the owner has the recovery key from the backend.
+
+    ONLY runs if the device is marked STOLEN on the backend AND BitLocker
+    is currently ON. Refuses in every other case to avoid an accidental
+    self-destruct.
+    """
+    if not _HAS_BITLOCKER:
+        print("INSTANT_WIPE refused: BitLocker module unavailable"); return
+    try:
+        # Safety gate 1: server-side status must be STOLEN
+        cfg = triggers.fetch_config(device_id) if _HAS_TRIGGERS else {}
+        if cfg.get("status") != "STOLEN":
+            print("INSTANT_WIPE refused: device is not marked STOLEN on server")
+            triggers.send_alert(device_id, "Instant wipe refused",
+                "The device is not marked STOLEN. Mark it first, then re-issue.")
+            return
+        # Safety gate 2: BitLocker must be ON (otherwise there is nothing
+        # to crypto-erase — falling through would leave the drive fully
+        # readable). Fall back to the legacy overwrite wipe in that case.
+        st = bitlocker.status_for_volume("C:")
+        if st["protection"] != "On":
+            print("INSTANT_WIPE: BitLocker OFF — falling back to overwrite wipe")
+            wipe_user_data()
+            triggers.send_alert(device_id, "Overwrite wipe running",
+                "BitLocker was OFF on this device. Files being deleted instead. "
+                "Enable BitLocker to get instant crypto-erase in future.")
+            return
+        # Do the deed
+        triggers.send_alert(device_id, "Instant wipe engaged",
+            "Crypto-erase in progress. Drive will be unreadable after reboot.")
+        ok = bitlocker.crypto_erase("C:")
+        if ok:
+            print("INSTANT_WIPE: crypto-erase complete, rebooting")
+        else:
+            print("INSTANT_WIPE: crypto-erase failed")
+    except Exception as e:
+        print(f"instant_wipe error: {e}")
+
+
 def send_location(device_id):
     try:
         # ISP/IP lookup gives city / country / ISP / public IP (network context)
@@ -456,6 +576,9 @@ def auto_report(device_id):
     for fn in [send_system_info, send_network_info, send_disk_info, send_process_info, send_location]:
         try: fn(device_id)
         except Exception as e: print(f"{fn.__name__} error: {e}")
+    # T8: also report BitLocker status so the owner can see it in the app
+    try: report_bitlocker_status(device_id)
+    except Exception as e: print(f"bitlocker status error: {e}")
     print("--- Done ---")
 
 # ── Command handlers ───────────────────────────────────────────────────────────
@@ -740,6 +863,15 @@ if _HAS_DETERRENT:
     try: deterrent_lock.restore_on_boot()
     except Exception as _re: print(f"deterrent restore failed: {_re}")
 
+# T8: if BitLocker is already ON but we haven't escrowed a key yet, do it now.
+# This is idempotent — bitlocker.has_escrowed_key() short-circuits repeats.
+if _HAS_BITLOCKER:
+    try:
+        _st = bitlocker.status_for_volume("C:")
+        if _st.get("protection") == "On" and not bitlocker.has_escrowed_key():
+            escrow_bitlocker_key(DEVICE_ID, "C:")
+    except Exception as _be: print(f"bitlocker startup escrow error: {_be}")
+
 auto_report(DEVICE_ID)
 
 AUTO_REPORT_INTERVAL = 60   # seconds between full auto-reports
@@ -867,6 +999,27 @@ while True:
                         deterrent_lock.deactivate()
                     else:
                         print("Deterrent lock module unavailable")
+
+                # T8: BitLocker orchestration + instant crypto-erase wipe
+                elif ctype == "BITLOCKER_STATUS":
+                    report_bitlocker_status(DEVICE_ID)
+
+                elif ctype == "ENABLE_BITLOCKER":
+                    # Optional payload: {"volume": "C:"} — defaults to C:
+                    letter = "C:"
+                    try:
+                        payload = cmd.get("payload") or {}
+                        if isinstance(payload, str):
+                            try: payload = json.loads(payload)
+                            except Exception: payload = {}
+                        letter = payload.get("volume", "C:") or "C:"
+                    except Exception:
+                        pass
+                    enable_bitlocker(DEVICE_ID, letter)
+
+                elif ctype == "INSTANT_WIPE":
+                    # Irreversible. See instant_wipe() for its safety gates.
+                    instant_wipe(DEVICE_ID)
 
                 # Acknowledge command
                 requests.post(f"{BASE_URL}/api/command/acknowledge/{cid}", timeout=8)

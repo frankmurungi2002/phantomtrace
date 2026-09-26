@@ -137,6 +137,14 @@ class Device(db.Model):
     vault_key = db.Column(db.Text)
     # T7 offline auto-lock threshold in minutes (agent default = 15)
     offline_lock_minutes = db.Column(db.Integer)
+    # T8 BitLocker orchestration
+    bitlocker_protection   = db.Column(db.String(20))    # On / Off / Unknown
+    bitlocker_conversion   = db.Column(db.String(40))    # Fully Encrypted / ...
+    bitlocker_percent      = db.Column(db.Integer)
+    bitlocker_method       = db.Column(db.String(40))    # XTS-AES 128 / ...
+    bitlocker_key_id       = db.Column(db.String(40))    # GUID of our protector
+    bitlocker_recovery_key = db.Column(db.String(80))    # 48-digit recovery key
+    bitlocker_updated_at   = db.Column(db.DateTime)
 
 class Sighting(db.Model):
     __tablename__ = 'sightings'
@@ -410,6 +418,14 @@ def agent_config(device_id):
         # T7: offline auto-lock threshold in minutes. Uses column if set,
         # else the agent falls back to its own default (15 min).
         'offline_lock_minutes': getattr(device, 'offline_lock_minutes', None),
+        # T8: BitLocker status so the mobile app can show a shield state
+        'bitlocker': {
+            'protection':  getattr(device, 'bitlocker_protection', None),
+            'conversion':  getattr(device, 'bitlocker_conversion', None),
+            'percent':     getattr(device, 'bitlocker_percent', None),
+            'method':      getattr(device, 'bitlocker_method', None),
+            'key_escrowed': bool(getattr(device, 'bitlocker_recovery_key', None)),
+        },
     }), 200
 
 
@@ -434,6 +450,96 @@ def set_offline_lock_config():
     device.offline_lock_minutes = minutes
     db.session.commit()
     return jsonify({'message': f'Offline-lock threshold set to {minutes} min'}), 200
+
+
+# ── T8: BitLocker orchestration ────────────────────────────────────────────
+# 1) Agent → backend: report current BitLocker status of the C: volume (and
+#    any others). We keep the SYSTEM volume's status on the device row.
+@app.route('/api/device/bitlocker-status', methods=['POST'])
+def bitlocker_status():
+    data = request.get_json() or {}
+    device_id = data.get('device_id')
+    volumes   = data.get('volumes', [])
+    if not device_id:
+        return jsonify({'error': 'device_id required'}), 400
+    device = Device.query.filter_by(id=device_id).first()
+    if not device:
+        return jsonify({'error': 'Device not found'}), 404
+    sys_vol = next((v for v in volumes if str(v.get('volume','')).upper() == 'C:'), None)
+    if sys_vol:
+        device.bitlocker_protection = sys_vol.get('protection')
+        device.bitlocker_conversion = sys_vol.get('conversion')
+        try:
+            p = sys_vol.get('percent')
+            device.bitlocker_percent = int(p) if p is not None else None
+        except Exception:
+            device.bitlocker_percent = None
+        device.bitlocker_method = sys_vol.get('encryption_method')
+        device.bitlocker_updated_at = datetime.utcnow()
+        db.session.commit()
+    return jsonify({'message': 'BitLocker status recorded'}), 200
+
+
+# 2) Agent → backend: escrow the 48-digit recovery key so the owner can
+#    always recover data even if the device is wiped. Stored server-side
+#    and only ever released to the authenticated owner via the endpoint
+#    below.
+@app.route('/api/device/bitlocker-key', methods=['POST'])
+def bitlocker_key():
+    data = request.get_json() or {}
+    device_id = data.get('device_id')
+    key       = data.get('recovery_key')
+    key_id    = data.get('key_id')
+    if not device_id or not key:
+        return jsonify({'error': 'device_id and recovery_key required'}), 400
+    device = Device.query.filter_by(id=device_id).first()
+    if not device:
+        return jsonify({'error': 'Device not found'}), 404
+    device.bitlocker_recovery_key = key
+    device.bitlocker_key_id       = key_id
+    db.session.commit()
+    return jsonify({'message': 'Recovery key escrowed'}), 200
+
+
+# 3) Owner → backend: fetch the recovery key. JWT-protected. Meant for the
+#    "I need to recover my data" flow shown in the app after a wipe.
+@app.route('/api/device/<device_id>/bitlocker-key', methods=['GET'])
+@jwt_required()
+def get_bitlocker_key(device_id):
+    device = Device.query.filter_by(id=device_id).first()
+    if not device:
+        return jsonify({'error': 'Device not found'}), 404
+    if not device.bitlocker_recovery_key:
+        return jsonify({'error': 'No recovery key on file'}), 404
+    return jsonify({
+        'key_id':       device.bitlocker_key_id,
+        'recovery_key': device.bitlocker_recovery_key,
+    }), 200
+
+
+# 4) Owner → backend: issue INSTANT_WIPE. Requires the device to already
+#    be marked STOLEN and requires explicit "confirmed": true in the body.
+#    Adds an extra layer above the agent's own safety gates.
+@app.route('/api/device/instant-wipe', methods=['POST'])
+@jwt_required()
+def instant_wipe_endpoint():
+    data = request.get_json() or {}
+    device_id = data.get('device_id')
+    confirmed = bool(data.get('confirmed'))
+    if not device_id:
+        return jsonify({'error': 'device_id required'}), 400
+    if not confirmed:
+        return jsonify({'error': 'confirmed=true required for destructive action'}), 400
+    device = Device.query.filter_by(id=device_id).first()
+    if not device:
+        return jsonify({'error': 'Device not found'}), 404
+    if device.status != 'STOLEN':
+        return jsonify({'error': 'Device is not marked STOLEN. Mark it first.'}), 409
+    cmd = Command(device_id=device_id, command_type='INSTANT_WIPE')
+    db.session.add(cmd)
+    db.session.commit()
+    return jsonify({'message': 'Instant wipe queued', 'command_id': cmd.id}), 201
+
 
 # ── T5: agent stores the vault key it generated (so the owner can restore) ─────
 @app.route('/api/device/vault-key', methods=['POST'])
@@ -785,7 +891,8 @@ _ALLOWED_COMMANDS = {
     'LOCK','PHOTO','ALARM','AUDIO','WIPE','SYSTEM_INFO','GET_NETWORK',
     'GET_DISKS','GET_PROCESSES','SCREENSHOT','GET_LOCATION','STOP_ALARM',
     'SECURE_DATA','RESTORE_DATA',
-    'DETERRENT_LOCK','UNLOCK_DETERRENT',   # T4
+    'DETERRENT_LOCK','UNLOCK_DETERRENT',                        # T4
+    'BITLOCKER_STATUS','ENABLE_BITLOCKER','INSTANT_WIPE',       # T8
 }
 
 @app.route('/api/command/send', methods=['POST'])
@@ -1072,7 +1179,14 @@ with app.app_context():
                  "home_lng DOUBLE PRECISION",
                  "geofence_radius DOUBLE PRECISION",
                  "vault_key TEXT",
-                 "offline_lock_minutes INTEGER"):   # T7
+                 "offline_lock_minutes INTEGER",           # T7
+                 "bitlocker_protection VARCHAR(20)",       # T8
+                 "bitlocker_conversion VARCHAR(40)",       # T8
+                 "bitlocker_percent INTEGER",              # T8
+                 "bitlocker_method VARCHAR(40)",           # T8
+                 "bitlocker_key_id VARCHAR(40)",           # T8
+                 "bitlocker_recovery_key VARCHAR(80)",     # T8
+                 "bitlocker_updated_at TIMESTAMP"):        # T8
         try:
             db.session.execute(db.text(
                 f"ALTER TABLE devices ADD COLUMN IF NOT EXISTS {_col}"

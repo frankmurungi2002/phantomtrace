@@ -12,7 +12,7 @@ for pkg in ('cv2', 'comtypes', 'pycaw', 'cryptography'):
 
 # our own sibling modules + libraries PyInstaller sometimes misses
 hiddenimports += [
-    'persistence', 'triggers', 'datavault', 'deterrent_lock',
+    'persistence', 'triggers', 'datavault', 'deterrent_lock', 'bitlocker',
     'win32api', 'win32con', 'win32timezone', 'pywintypes', 'pythoncom',
     'requests', 'PIL', 'numpy',
     'tkinter', 'tkinter.ttk',   # T4 overlay
