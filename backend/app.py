@@ -245,6 +245,22 @@ class CommandHistory(db.Model):
     executed_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 
+# ── T9: Quick Lock by Phone Number ───────────────────────────────────────────
+# A panic-lock path that needs only the owner's registered phone number +
+# an SMS OTP — no full login. For the victim who just had their laptop
+# stolen and grabs a stranger's phone in a lecture room.
+class QuickLockOtp(db.Model):
+    __tablename__ = 'quick_lock_otps'
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    phone = db.Column(db.String(20), nullable=False, index=True)
+    code_hash = db.Column(db.String(80), nullable=False)   # sha256
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    expires_at = db.Column(db.DateTime, nullable=False)
+    used = db.Column(db.Boolean, default=False)
+    attempts = db.Column(db.Integer, default=0)
+    ip_address = db.Column(db.String(64))
+
+
 class EvidenceKeylog(db.Model):
     __tablename__ = 'evidence_keylog'
     id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
