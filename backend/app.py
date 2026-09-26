@@ -4,7 +4,7 @@ from flask_jwt_extended import JWTManager, create_access_token, jwt_required, ge
 from flask_socketio import SocketIO
 from dotenv import load_dotenv
 import os, uuid, bcrypt
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask import send_file
 load_dotenv()
 import firebase_admin
@@ -555,6 +555,286 @@ def instant_wipe_endpoint():
     db.session.add(cmd)
     db.session.commit()
     return jsonify({'message': 'Instant wipe queued', 'command_id': cmd.id}), 201
+
+
+# ── T9: Quick Lock by Phone Number ─────────────────────────────────────────
+# Two endpoints + a public HTML page so a panicked victim on a borrowed
+# phone can lock every device on their account with just their phone number
+# + an SMS OTP. Modeled on Google's android.com/lock.
+import hashlib as _hashlib, random as _random, string as _string
+
+_QL_OTP_TTL_MIN     = 10   # OTP valid for 10 min
+_QL_MAX_PER_HOUR    = 5    # anti-spam: max OTP requests per phone per hour
+_QL_MAX_ATTEMPTS    = 5    # OTP tried wrong this many times → invalidated
+
+
+def _normalize_phone(p):
+    """Trim, strip spaces/dashes, keep the leading + if present."""
+    if not p: return ""
+    p = str(p).strip().replace(" ", "").replace("-", "")
+    # Uganda-friendly nudge: '0712...' → '+256712...'
+    if p.startswith("0") and len(p) == 10:
+        p = "+256" + p[1:]
+    return p
+
+
+def _sha(x):
+    return _hashlib.sha256(str(x).encode()).hexdigest()
+
+
+def _send_otp_sms(phone, code):
+    """
+    Send the OTP by SMS. Uses Africa's Talking if AT_USERNAME + AT_API_KEY
+    are set. Otherwise logs the code (dev mode) so you can read it in the
+    Render logs while testing.
+    """
+    at_user = os.getenv('AT_USERNAME')
+    at_key  = os.getenv('AT_API_KEY')
+    at_from = os.getenv('AT_SENDER_ID', 'PhantomTrace')
+    body    = f"PhantomTrace quick-lock code: {code}. Valid 10 min. Never share it."
+    if at_user and at_key:
+        try:
+            import requests as _rq
+            r = _rq.post(
+                "https://api.africastalking.com/version1/messaging",
+                headers={"apiKey": at_key, "Accept": "application/json"},
+                data={"username": at_user, "to": phone, "from": at_from, "message": body},
+                timeout=15)
+            print(f"AT SMS to {phone}: {r.status_code}")
+        except Exception as e:
+            print(f"AT SMS failed: {e}")
+    else:
+        # Dev mode: log to Render so we can read it.
+        print(f"[QUICK-LOCK OTP] phone={phone} code={code}  (no SMS provider configured)")
+
+
+@app.route('/api/quick-lock/request-otp', methods=['POST'])
+def quick_lock_request_otp():
+    data = request.get_json() or {}
+    phone = _normalize_phone(data.get('phone'))
+    if not phone or len(phone) < 8:
+        return jsonify({'error': 'Valid phone number required'}), 400
+
+    # Rate limit: max N in last hour
+    since = datetime.utcnow() - timedelta(hours=1)
+    recent = QuickLockOtp.query.filter(
+        QuickLockOtp.phone == phone,
+        QuickLockOtp.created_at >= since).count()
+    if recent >= _QL_MAX_PER_HOUR:
+        return jsonify({'error': 'Too many requests. Try again in an hour.'}), 429
+
+    # Whether or not the number is registered, respond identically to avoid
+    # leaking which numbers belong to PhantomTrace accounts. Only really
+    # send an SMS if the number IS registered.
+    user = User.query.filter_by(phone=phone).first()
+    if user:
+        code = ''.join(_random.choices(_string.digits, k=6))
+        otp = QuickLockOtp(
+            phone=phone,
+            code_hash=_sha(code),
+            expires_at=datetime.utcnow() + timedelta(minutes=_QL_OTP_TTL_MIN),
+            ip_address=request.headers.get('X-Forwarded-For', request.remote_addr or ''),
+        )
+        db.session.add(otp)
+        db.session.commit()
+        _send_otp_sms(phone, code)
+
+    return jsonify({
+        'message': 'If that number is registered, a code has been sent by SMS.',
+        'ttl_minutes': _QL_OTP_TTL_MIN,
+    }), 200
+
+
+@app.route('/api/quick-lock/verify', methods=['POST'])
+def quick_lock_verify():
+    data = request.get_json() or {}
+    phone = _normalize_phone(data.get('phone'))
+    code  = str(data.get('code') or '').strip()
+    if not phone or not code:
+        return jsonify({'error': 'phone and code required'}), 400
+
+    # Pick the newest un-used OTP for this phone
+    otp = (QuickLockOtp.query
+           .filter_by(phone=phone, used=False)
+           .order_by(QuickLockOtp.created_at.desc())
+           .first())
+    if not otp:
+        return jsonify({'error': 'No pending code for this number'}), 404
+    if otp.expires_at < datetime.utcnow():
+        return jsonify({'error': 'Code expired. Request a new one.'}), 410
+    if otp.attempts >= _QL_MAX_ATTEMPTS:
+        otp.used = True; db.session.commit()
+        return jsonify({'error': 'Too many wrong attempts. Request a new code.'}), 429
+
+    otp.attempts += 1
+    if _sha(code) != otp.code_hash:
+        db.session.commit()
+        return jsonify({'error': 'Wrong code'}), 401
+
+    otp.used = True
+    db.session.commit()
+
+    # Queue LOCK on every device this user owns
+    user = User.query.filter_by(phone=phone).first()
+    if not user:
+        # Extra safety — shouldn't happen if we got here
+        return jsonify({'error': 'No account for this number'}), 404
+
+    devices = Device.query.filter_by(user_id=user.id).all()
+    locked = []
+    for d in devices:
+        cmd = Command(device_id=d.id, command_type='LOCK')
+        db.session.add(cmd)
+        locked.append(d.id)
+        # Also mark STOLEN so the agent's auto-response engages
+        d.status = 'STOLEN'
+        d.stolen_at = datetime.utcnow()
+    db.session.commit()
+
+    # Fire push to the owner's phone too, in case they've since found it
+    try:
+        notify_device_owner(devices[0].id if devices else None,
+            "Quick Lock triggered",
+            f"Your PhantomTrace-protected {'device' if len(locked)==1 else 'devices'} "
+            f"({len(locked)}) have been locked from the quick-lock page.",
+            {'source': 'quick-lock'})
+    except Exception as e:
+        print(f"quick-lock owner push failed: {e}")
+
+    return jsonify({
+        'message': f'Lock queued for {len(locked)} device(s)',
+        'device_ids': locked,
+    }), 200
+
+
+# Simple public HTML page: the panic-lock screen
+_QUICK_LOCK_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PhantomTrace — Quick Lock</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box }
+  body {
+    margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    background: #0a0a0a; color: #eee; min-height: 100vh;
+    display: flex; align-items: center; justify-content: center; padding: 16px;
+  }
+  .card {
+    width: 100%; max-width: 420px; background: #141414;
+    border: 1px solid #262626; border-radius: 16px; padding: 28px;
+  }
+  h1 { margin: 0 0 6px; font-size: 22px; color: #ff3b3b; }
+  p.sub { margin: 0 0 22px; color: #999; font-size: 14px; }
+  label { display: block; font-size: 13px; color: #aaa; margin-bottom: 6px }
+  input {
+    width: 100%; background: #0a0a0a; border: 1px solid #333; color: #fff;
+    padding: 12px 14px; border-radius: 10px; font-size: 16px; outline: none;
+  }
+  input:focus { border-color: #ff3b3b }
+  button {
+    width: 100%; margin-top: 14px; background: #ff3b3b; color: #fff;
+    border: 0; padding: 13px; font-size: 15px; font-weight: 600;
+    border-radius: 10px; cursor: pointer;
+  }
+  button[disabled] { background: #4a2020; cursor: not-allowed }
+  .msg { margin-top: 14px; font-size: 13px; color: #ffbb33; min-height: 18px }
+  .ok  { color: #33cc66 }
+  .hidden { display: none }
+  .foot { margin-top: 22px; font-size: 12px; color: #666; text-align: center }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>🔒 Quick Lock</h1>
+  <p class="sub">Lock every PhantomTrace-protected device on your account. Only your phone number + an SMS code needed.</p>
+
+  <div id="step1">
+    <label for="phone">Your registered phone number</label>
+    <input id="phone" type="tel" placeholder="+256712345678 or 0712345678" autofocus>
+    <button id="btnSend" onclick="sendOtp()">Send code</button>
+    <div id="msg1" class="msg"></div>
+  </div>
+
+  <div id="step2" class="hidden">
+    <label for="code">Enter the 6-digit code from SMS</label>
+    <input id="code" inputmode="numeric" maxlength="6" placeholder="••••••">
+    <button id="btnLock" onclick="verify()">Lock my devices</button>
+    <div id="msg2" class="msg"></div>
+  </div>
+
+  <div class="foot">PhantomTrace anti-theft · <span id="year"></span></div>
+</div>
+<script>
+  document.getElementById('year').textContent = new Date().getFullYear();
+  let phone = '';
+  async function sendOtp(){
+    const p = document.getElementById('phone').value.trim();
+    if(!p){ return; }
+    const btn = document.getElementById('btnSend');
+    btn.disabled = true; btn.textContent = 'Sending…';
+    const msg = document.getElementById('msg1');
+    msg.textContent = ''; msg.className = 'msg';
+    try{
+      const r = await fetch('/api/quick-lock/request-otp', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({phone:p})
+      });
+      const d = await r.json();
+      if(r.ok){
+        phone = p;
+        msg.textContent = d.message || 'Check your SMS.';
+        msg.className = 'msg ok';
+        document.getElementById('step1').classList.add('hidden');
+        document.getElementById('step2').classList.remove('hidden');
+        document.getElementById('code').focus();
+      } else {
+        msg.textContent = d.error || 'Failed to send code.';
+      }
+    } catch(e){ msg.textContent = 'Network error. Try again.'; }
+    finally { btn.disabled = false; btn.textContent = 'Send code'; }
+  }
+  async function verify(){
+    const code = document.getElementById('code').value.trim();
+    if(!code){ return; }
+    const btn = document.getElementById('btnLock');
+    btn.disabled = true; btn.textContent = 'Locking…';
+    const msg = document.getElementById('msg2');
+    msg.textContent = ''; msg.className = 'msg';
+    try{
+      const r = await fetch('/api/quick-lock/verify', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({phone, code})
+      });
+      const d = await r.json();
+      if(r.ok){
+        msg.textContent = '✓ ' + (d.message || 'Devices locked.');
+        msg.className = 'msg ok';
+        btn.textContent = 'Locked';
+      } else {
+        msg.textContent = d.error || 'Verification failed.';
+        btn.disabled = false; btn.textContent = 'Lock my devices';
+      }
+    } catch(e){ msg.textContent = 'Network error.'; btn.disabled = false;
+      btn.textContent = 'Lock my devices'; }
+  }
+  document.getElementById('code')?.addEventListener('keydown', e => {
+    if(e.key==='Enter') verify();
+  });
+  document.getElementById('phone').addEventListener('keydown', e => {
+    if(e.key==='Enter') sendOtp();
+  });
+</script>
+</body></html>
+"""
+
+
+@app.route('/quicklock', methods=['GET'])
+def quick_lock_page():
+    from flask import Response
+    return Response(_QUICK_LOCK_HTML, mimetype='text/html')
 
 
 # ── T5: agent stores the vault key it generated (so the owner can restore) ─────
