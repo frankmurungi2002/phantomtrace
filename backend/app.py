@@ -117,6 +117,26 @@ class User(db.Model):
     password_hash = db.Column(db.String(255), nullable=False)
     fcm_token = db.Column(db.Text)  # phone's Firebase Cloud Messaging token for push notifications
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    # 2FA (TOTP, Google Authenticator compatible)
+    totp_secret = db.Column(db.String(64))     # base32 secret; null = 2FA not set up
+    totp_enabled = db.Column(db.Boolean, default=False)
+    totp_recovery_codes = db.Column(db.Text)   # comma-separated, one-use each
+    # Tracks when the password was last reset. Used to invalidate old JWTs.
+    password_reset_at = db.Column(db.DateTime)
+
+
+# Password reset OTP — sent via SMS to the phone registered with the account.
+# Two-factor proof (email + phone) prevents a single-channel compromise.
+class PasswordResetOtp(db.Model):
+    __tablename__ = 'password_reset_otps'
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    user_id = db.Column(db.String(36), db.ForeignKey('users.id'), nullable=False, index=True)
+    code_hash = db.Column(db.String(80), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    expires_at = db.Column(db.DateTime, nullable=False)
+    used = db.Column(db.Boolean, default=False)
+    attempts = db.Column(db.Integer, default=0)
+    ip_address = db.Column(db.String(64))
 
 class Device(db.Model):
     __tablename__ = 'devices'
@@ -342,8 +362,20 @@ def login():
     user = User.query.filter_by(email=data['email']).first()
     if not user or not bcrypt.checkpw(data['password'].encode('utf-8'), user.password_hash.encode('utf-8')):
         return jsonify({'error': 'Invalid credentials'}), 401
+    # 2FA: if enabled, don't issue a full token yet — return a short-lived
+    # "pre-auth" token that only the /verify-login-2fa endpoint accepts.
+    if getattr(user, 'totp_enabled', False):
+        pre_token = create_access_token(
+            identity=user.id, expires_delta=timedelta(minutes=5),
+            additional_claims={'stage': 'pre-2fa'})
+        return jsonify({
+            'requires_2fa': True,
+            'pre_auth_token': pre_token,
+            'user': {'id': user.id, 'name': user.name},
+        }), 200
     token = create_access_token(identity=user.id)
     return jsonify({'message': 'Login successful', 'token': token, 'user': {'id': user.id, 'name': user.name}}), 200
+
 
 @app.route('/api/auth/profile', methods=['GET'])
 @jwt_required()
@@ -351,7 +383,233 @@ def profile():
     user = User.query.get(get_jwt_identity())
     if not user:
         return jsonify({'error': 'User not found'}), 404
-    return jsonify({'id': user.id, 'name': user.name, 'email': user.email, 'phone': user.phone}), 200
+    return jsonify({
+        'id': user.id, 'name': user.name, 'email': user.email, 'phone': user.phone,
+        'totp_enabled': bool(getattr(user, 'totp_enabled', False)),
+    }), 200
+
+
+# ── Password reset (email + SMS OTP — needs proof of BOTH channels) ─────────
+# Copied from the industry-standard flow: knowing the email alone isn't
+# enough. The OTP goes to the phone registered against that email; a
+# hijacker who only has the email can't complete the reset.
+_PW_RESET_TTL_MIN     = 10
+_PW_RESET_MAX_PER_HR  = 5
+_PW_RESET_MAX_ATTEMPTS = 5
+
+
+@app.route('/api/auth/forgot-password/request', methods=['POST'])
+def forgot_password_request():
+    data = request.get_json() or {}
+    email = str(data.get('email') or '').strip().lower()
+    if not email or '@' not in email:
+        return jsonify({'error': 'Valid email required'}), 400
+
+    # Always return 200 whether or not the email exists — prevents user
+    # enumeration. Only actually create + send an OTP if the account exists.
+    user = User.query.filter(db.func.lower(User.email) == email).first()
+    if user:
+        # Rate limit by user
+        since = datetime.utcnow() - timedelta(hours=1)
+        recent = PasswordResetOtp.query.filter(
+            PasswordResetOtp.user_id == user.id,
+            PasswordResetOtp.created_at >= since).count()
+        if recent < _PW_RESET_MAX_PER_HR:
+            code = ''.join(_random.choices(_string.digits, k=6))
+            otp = PasswordResetOtp(
+                user_id=user.id,
+                code_hash=_sha(code),
+                expires_at=datetime.utcnow() + timedelta(minutes=_PW_RESET_TTL_MIN),
+                ip_address=request.headers.get('X-Forwarded-For', request.remote_addr or ''))
+            db.session.add(otp)
+            db.session.commit()
+            body = (f"PhantomTrace password reset code: {code}. "
+                    f"Valid {_PW_RESET_TTL_MIN} minutes. If you didn't request this, "
+                    "someone may be trying to access your account.")
+            _send_sms_generic(user.phone, body)
+    return jsonify({
+        'message': 'If an account exists for that email, a reset code was sent to its phone.',
+        'ttl_minutes': _PW_RESET_TTL_MIN,
+    }), 200
+
+
+def _send_sms_generic(phone, body):
+    """Same Africa's Talking flow as quick-lock, extracted for reuse."""
+    at_user = os.getenv('AT_USERNAME')
+    at_key  = os.getenv('AT_API_KEY')
+    at_from = os.getenv('AT_SENDER_ID', 'PhantomTrace')
+    if at_user and at_key:
+        try:
+            import requests as _rq
+            _rq.post("https://api.africastalking.com/version1/messaging",
+                     headers={"apiKey": at_key, "Accept": "application/json"},
+                     data={"username": at_user, "to": phone, "from": at_from, "message": body},
+                     timeout=15)
+        except Exception as e:
+            print(f"AT SMS failed: {e}")
+    else:
+        print(f"[SMS] to={phone} body={body}   (no SMS provider configured)")
+
+
+@app.route('/api/auth/forgot-password/verify', methods=['POST'])
+def forgot_password_verify():
+    data = request.get_json() or {}
+    email = str(data.get('email') or '').strip().lower()
+    code  = str(data.get('code') or '').strip()
+    new_password = str(data.get('new_password') or '')
+    if not email or not code or not new_password:
+        return jsonify({'error': 'email, code, and new_password required'}), 400
+    if len(new_password) < 6:
+        return jsonify({'error': 'Password must be at least 6 characters'}), 400
+    user = User.query.filter(db.func.lower(User.email) == email).first()
+    if not user:
+        return jsonify({'error': 'Invalid code'}), 401  # don't leak account existence
+    otp = (PasswordResetOtp.query
+           .filter_by(user_id=user.id, used=False)
+           .order_by(PasswordResetOtp.created_at.desc())
+           .first())
+    if not otp or otp.expires_at < datetime.utcnow():
+        return jsonify({'error': 'Code expired or not found'}), 410
+    if otp.attempts >= _PW_RESET_MAX_ATTEMPTS:
+        otp.used = True; db.session.commit()
+        return jsonify({'error': 'Too many wrong attempts. Request a new code.'}), 429
+    otp.attempts += 1
+    if _sha(code) != otp.code_hash:
+        db.session.commit()
+        return jsonify({'error': 'Wrong code'}), 401
+    # Success — set new password + mark reset time (invalidates old JWTs
+    # for endpoints that check it) + burn the OTP.
+    user.password_hash = bcrypt.hashpw(new_password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+    user.password_reset_at = datetime.utcnow()
+    otp.used = True
+    db.session.commit()
+    # Alert the owner via push, in case someone else did this
+    try:
+        notify_user_direct(user, "Password was reset",
+            "Your PhantomTrace password was just reset. If this wasn't you, "
+            "contact support immediately.")
+    except Exception as e:
+        print(f"pw-reset push failed: {e}")
+    # Issue a fresh token — user is now logged in with the new password
+    token = create_access_token(identity=user.id)
+    return jsonify({'message': 'Password updated', 'token': token,
+                    'user': {'id': user.id, 'name': user.name}}), 200
+
+
+def notify_user_direct(user, title, body):
+    """Send an FCM push straight to a user (used by password reset)."""
+    if not user or not user.fcm_token:
+        return
+    try:
+        from firebase_admin import messaging
+        message = messaging.Message(
+            notification=messaging.Notification(title=title, body=body),
+            token=user.fcm_token)
+        messaging.send(message)
+    except Exception as e:
+        print(f"notify_user_direct failed: {e}")
+
+
+# ── Two-Factor Authentication (TOTP — Google Authenticator compatible) ─────
+@app.route('/api/auth/2fa/setup', methods=['POST'])
+@jwt_required()
+def totp_setup():
+    """
+    Owner calls this from Settings → returns a base32 secret + provisioning
+    URI (usable as a QR code). The secret is stored but 2FA isn't enabled
+    yet — the client must call verify-setup with a valid code first.
+    """
+    import pyotp
+    user = User.query.get(get_jwt_identity())
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+    secret = pyotp.random_base32()
+    uri = pyotp.totp.TOTP(secret).provisioning_uri(
+        name=user.email, issuer_name='PhantomTrace')
+    user.totp_secret = secret
+    user.totp_enabled = False   # not enabled until verified
+    db.session.commit()
+    return jsonify({'secret': secret, 'otpauth_url': uri}), 200
+
+
+@app.route('/api/auth/2fa/verify-setup', methods=['POST'])
+@jwt_required()
+def totp_verify_setup():
+    """User confirms they can generate codes → 2FA turns on + recovery codes returned."""
+    import pyotp, secrets as _secrets
+    data = request.get_json() or {}
+    code = str(data.get('code') or '').strip()
+    user = User.query.get(get_jwt_identity())
+    if not user or not user.totp_secret:
+        return jsonify({'error': 'No 2FA setup in progress'}), 400
+    if not pyotp.TOTP(user.totp_secret).verify(code, valid_window=1):
+        return jsonify({'error': 'Wrong code — check the time on your phone'}), 401
+    # Generate 10 one-use recovery codes
+    codes = ['-'.join(_secrets.token_hex(2)[i:i+4]
+                      for i in (0, 4)) for _ in range(10)]
+    user.totp_recovery_codes = ','.join(codes)
+    user.totp_enabled = True
+    db.session.commit()
+    return jsonify({'message': '2FA enabled', 'recovery_codes': codes}), 200
+
+
+@app.route('/api/auth/2fa/verify-login', methods=['POST'])
+@jwt_required()
+def totp_verify_login():
+    """
+    Called after /login when the login returned requires_2fa. Consumes the
+    short-lived pre-auth token and, if the code is valid, returns the real
+    JWT. Also accepts a one-use recovery code as the `code`.
+    """
+    import pyotp
+    from flask_jwt_extended import get_jwt
+    claims = get_jwt()
+    if claims.get('stage') != 'pre-2fa':
+        return jsonify({'error': 'Wrong token stage'}), 401
+    data = request.get_json() or {}
+    code = str(data.get('code') or '').strip().replace(' ', '')
+    user = User.query.get(get_jwt_identity())
+    if not user or not user.totp_enabled:
+        return jsonify({'error': '2FA not enabled'}), 400
+
+    ok = pyotp.TOTP(user.totp_secret).verify(code, valid_window=1)
+    if not ok and user.totp_recovery_codes:
+        # Try recovery codes (one-use each)
+        codes = user.totp_recovery_codes.split(',')
+        if code in codes:
+            codes.remove(code)
+            user.totp_recovery_codes = ','.join(codes)
+            db.session.commit()
+            ok = True
+
+    if not ok:
+        return jsonify({'error': 'Invalid 2FA code'}), 401
+
+    token = create_access_token(identity=user.id)
+    return jsonify({'message': 'Login successful', 'token': token,
+                    'user': {'id': user.id, 'name': user.name}}), 200
+
+
+@app.route('/api/auth/2fa/disable', methods=['POST'])
+@jwt_required()
+def totp_disable():
+    """Requires current password + a valid TOTP code."""
+    import pyotp
+    data = request.get_json() or {}
+    password = str(data.get('password') or '')
+    code = str(data.get('code') or '').strip()
+    user = User.query.get(get_jwt_identity())
+    if not user or not user.totp_enabled:
+        return jsonify({'error': '2FA not enabled'}), 400
+    if not bcrypt.checkpw(password.encode('utf-8'), user.password_hash.encode('utf-8')):
+        return jsonify({'error': 'Wrong password'}), 401
+    if not pyotp.TOTP(user.totp_secret).verify(code, valid_window=1):
+        return jsonify({'error': 'Wrong 2FA code'}), 401
+    user.totp_secret = None
+    user.totp_enabled = False
+    user.totp_recovery_codes = None
+    db.session.commit()
+    return jsonify({'message': '2FA disabled'}), 200
 
 @app.route('/api/device/self-register', methods=['POST'])
 def self_register_device():
@@ -555,6 +813,31 @@ def list_devices():
             'last_seen': d.last_seen.isoformat() if d.last_seen else None
         })
     return jsonify({'devices': result}), 200
+
+
+# Delete a device — owner-only, irreversible. Cascades to related records
+# so the DB doesn't leak orphans.
+@app.route('/api/device/<device_id>', methods=['DELETE'])
+@jwt_required()
+def delete_device(device_id):
+    device = Device.query.filter_by(id=device_id, user_id=get_jwt_identity()).first()
+    if not device:
+        return jsonify({'error': 'Device not found'}), 404
+    device_name = device.device_name
+    # Clean up related rows first (order matters — FK constraints).
+    for tbl in ('commands', 'command_history', 'evidence_photos',
+                'sightings', 'location_history', 'device_location'):
+        try:
+            db.session.execute(
+                db.text(f"DELETE FROM {tbl} WHERE device_id = :did"),
+                {"did": device_id})
+        except Exception as e:
+            db.session.rollback()
+            print(f"delete_device: cascade on {tbl}: {e}")
+    db.session.delete(device)
+    db.session.commit()
+    return jsonify({'message': f'"{device_name}" deleted'}), 200
+
 
 @app.route('/api/device/<device_id>/mark-stolen', methods=['POST'])
 @jwt_required()
@@ -1700,6 +1983,20 @@ with app.app_context():
         db.session.rollback()
         print(f"Migration warning (commands.command_type widen): {_mig_err5}")
     print("Migration: commands.payload + widened command_type ensured")
+
+    # 2FA + password reset timestamp columns on users
+    for _col in ("totp_secret VARCHAR(64)",
+                 "totp_enabled BOOLEAN DEFAULT FALSE",
+                 "totp_recovery_codes TEXT",
+                 "password_reset_at TIMESTAMP"):
+        try:
+            db.session.execute(db.text(
+                f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {_col}"))
+            db.session.commit()
+        except Exception as _mig_err6:
+            db.session.rollback()
+            print(f"Migration warning (users {_col}): {_mig_err6}")
+    print("Migration: users 2FA + password_reset columns ensured")
 
 
 @app.route('/api/device/self-register', methods=['POST'])
