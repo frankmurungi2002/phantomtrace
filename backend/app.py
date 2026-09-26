@@ -261,6 +261,27 @@ class QuickLockOtp(db.Model):
     ip_address = db.Column(db.String(64))
 
 
+# ── Device pairing codes (fixes broken auto-registration) ────────────────────
+# The old /api/device/self-register attached every new laptop to whichever
+# user was created first in the DB. This flow replaces that:
+# 1. User taps "Add Device" in the app → server creates a short pairing
+#    code tied to their user_id.
+# 2. User runs the agent on their laptop → agent prompts for the code.
+# 3. Agent posts to /api/device/pair with the code → device is created
+#    under the CORRECT user, agent gets device_id back.
+# Codes expire in 30 min so a leaked code isn't useful indefinitely.
+class DevicePairCode(db.Model):
+    __tablename__ = 'device_pair_codes'
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    code = db.Column(db.String(16), unique=True, nullable=False, index=True)
+    user_id = db.Column(db.String(36), db.ForeignKey('users.id'), nullable=False)
+    device_name_hint = db.Column(db.String(100))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    expires_at = db.Column(db.DateTime, nullable=False)
+    used_at = db.Column(db.DateTime)
+    device_id = db.Column(db.String(36))   # populated once paired
+
+
 class EvidenceKeylog(db.Model):
     __tablename__ = 'evidence_keylog'
     id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
@@ -334,15 +355,165 @@ def profile():
 
 @app.route('/api/device/self-register', methods=['POST'])
 def self_register_device():
-    data = request.get_json()
+    """
+    LEGACY / DEV endpoint. Attaches the device to whichever user was
+    created first. Kept for backwards compatibility with older agent
+    builds; new agents use /api/device/pair with a pairing code instead.
+    Refuses if there is more than one user, so a broadcast .exe can't
+    hijack an arbitrary account.
+    """
+    data = request.get_json() or {}
+    # Prefer owner_email if the caller supplied it — this makes the
+    # legacy endpoint at least behave sensibly for a single-user install.
+    owner_email = (data.get('owner_email') or '').strip().lower()
+    user = None
+    if owner_email:
+        user = User.query.filter(db.func.lower(User.email) == owner_email).first()
+    if not user:
+        # Only fall back to the first user if there is EXACTLY one
+        # user in the DB (single-user dev install). Otherwise refuse.
+        n = User.query.count()
+        if n == 1:
+            user = User.query.first()
+        else:
+            return jsonify({
+                'error': 'This build cannot self-register. Update to a newer '
+                         'agent and use a pairing code from the mobile app.'
+            }), 409
     device = Device(
-        user_id=db.session.execute(db.text('SELECT id FROM users LIMIT 1')).scalar(),
+        user_id=user.id,
         device_name=data.get('device_name', 'Unknown'),
         beacon_id=str(uuid.uuid4()).replace('-',''),
     )
     db.session.add(device)
     db.session.commit()
     return jsonify({'message': 'Registered', 'device_id': device.id}), 201
+
+
+# ── Device pairing (correct multi-user flow) ─────────────────────────────────
+_PAIR_CODE_TTL_MIN = 30
+
+def _generate_pair_code():
+    """8-char human-readable code, chunked like '83-KFN-217'."""
+    import random as _r, string as _s
+    # Avoid ambiguous chars (0/O, 1/I/L)
+    alphabet = ''.join(c for c in _s.ascii_uppercase + _s.digits
+                       if c not in '0O1IL')
+    parts = [
+        ''.join(_r.choices(_s.digits, k=2)),
+        ''.join(_r.choices(alphabet, k=3)),
+        ''.join(_r.choices(_s.digits, k=3)),
+    ]
+    return '-'.join(parts)
+
+
+@app.route('/api/device/create-pair-code', methods=['POST'])
+@jwt_required()
+def create_pair_code():
+    """
+    Owner (in the app) creates a pairing code. Returns the code + TTL.
+    Any existing un-used codes for this user are invalidated so we
+    never leave old codes lying around.
+    """
+    data = request.get_json() or {}
+    user_id = get_jwt_identity()
+
+    # Invalidate any active codes this user already has
+    now = datetime.utcnow()
+    DevicePairCode.query.filter(
+        DevicePairCode.user_id == user_id,
+        DevicePairCode.used_at.is_(None),
+        DevicePairCode.expires_at > now,
+    ).update({DevicePairCode.expires_at: now})
+
+    # Generate a unique code (retry on the astronomically unlikely collision)
+    for _ in range(10):
+        code = _generate_pair_code()
+        if not DevicePairCode.query.filter_by(code=code).first():
+            break
+
+    row = DevicePairCode(
+        code=code,
+        user_id=user_id,
+        device_name_hint=(data.get('device_name') or '').strip() or None,
+        expires_at=now + timedelta(minutes=_PAIR_CODE_TTL_MIN),
+    )
+    db.session.add(row)
+    db.session.commit()
+
+    return jsonify({
+        'code':        code,
+        'expires_in':  _PAIR_CODE_TTL_MIN * 60,   # seconds
+        'expires_at':  row.expires_at.isoformat(),
+    }), 201
+
+
+@app.route('/api/device/pair', methods=['POST'])
+def pair_device():
+    """
+    Agent side of the pairing flow. Takes a code + a device_name and
+    returns a device_id + user_id. Public (no JWT) — the code itself
+    is the authorization.
+    """
+    data = request.get_json() or {}
+    code = str(data.get('code') or '').strip().upper()
+    device_name = (data.get('device_name') or 'My Laptop').strip()[:100]
+    if not code:
+        return jsonify({'error': 'code required'}), 400
+
+    row = DevicePairCode.query.filter_by(code=code).first()
+    if not row:
+        return jsonify({'error': 'Invalid pairing code'}), 404
+    if row.used_at is not None:
+        return jsonify({'error': 'Pairing code already used'}), 409
+    if row.expires_at < datetime.utcnow():
+        return jsonify({'error': 'Pairing code expired. Generate a new one.'}), 410
+
+    device = Device(
+        user_id=row.user_id,
+        device_name=(row.device_name_hint or device_name),
+        beacon_id=str(uuid.uuid4()).replace('-', ''),
+    )
+    db.session.add(device)
+    row.used_at   = datetime.utcnow()
+    row.device_id = device.id
+    db.session.commit()
+
+    # Notify the owner's phone that pairing succeeded
+    try:
+        notify_device_owner(device.id,
+            "Device paired",
+            f"'{device.device_name}' is now protected by PhantomTrace.",
+            {'source': 'pairing'})
+    except Exception as e:
+        print(f"pair-owner-push failed: {e}")
+
+    return jsonify({
+        'message':   'Device paired',
+        'device_id': device.id,
+        'user_id':   row.user_id,
+        'beacon_id': device.beacon_id,
+        'device_name': device.device_name,
+    }), 201
+
+
+@app.route('/api/device/pair-status/<code>', methods=['GET'])
+@jwt_required()
+def pair_status(code):
+    """
+    The mobile app polls this while showing the pairing code, so it can
+    switch to 'Device paired!' automatically without a manual refresh.
+    """
+    row = DevicePairCode.query.filter_by(code=code.strip().upper()).first()
+    if not row or row.user_id != get_jwt_identity():
+        return jsonify({'error': 'Not found'}), 404
+    return jsonify({
+        'code':      row.code,
+        'paired':    row.used_at is not None,
+        'device_id': row.device_id,
+        'expired':   row.expires_at < datetime.utcnow(),
+        'expires_at': row.expires_at.isoformat(),
+    }), 200
 
 @app.route('/api/device/register', methods=['POST'])
 @jwt_required()
@@ -576,43 +747,6 @@ def _normalize_phone(p):
     if p.startswith("0") and len(p) == 10:
         p = "+256" + p[1:]
     return p
-
-
-def _phone_candidates(p):
-    """
-    Return every plausible way this same phone could have been stored at
-    registration time, so we can find the user regardless of format.
-    e.g. '+256712345678', '256712345678', '0712345678', '712345678'.
-    """
-    p = _normalize_phone(p)
-    cands = set([p])
-    if p.startswith("+"):
-        cands.add(p[1:])                         # 256712345678
-    if p.startswith("+256"):
-        cands.add("0" + p[4:])                    # 0712345678
-        cands.add(p[4:])                          # 712345678
-        cands.add(p[1:])                          # 256712345678
-    elif p.startswith("256"):
-        cands.add("+" + p)                        # +256712345678
-        cands.add("0" + p[3:])                    # 0712345678
-        cands.add(p[3:])                          # 712345678
-    elif p.startswith("0") and len(p) == 10:
-        # already normalized above, but just in case
-        cands.add("+256" + p[1:])
-        cands.add("256"  + p[1:])
-        cands.add(p[1:])
-    return [c for c in cands if c]
-
-
-def _find_user_by_phone(p):
-    """Look up a user by phone, trying every equivalent formatting."""
-    cands = _phone_candidates(p)
-    if not cands:
-        return None, None
-    user = User.query.filter(User.phone.in_(cands)).first()
-    if user:
-        return user, user.phone   # return the exact stored form
-    return None, None
 
 
 def _sha(x):

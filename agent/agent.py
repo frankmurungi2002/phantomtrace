@@ -98,7 +98,122 @@ _shutdown_blocked = False
 _alarm_active     = False
 
 # ── Device registration ────────────────────────────────────────────────────────
+def _pair_via_dialog(device_name):
+    """
+    First-launch pairing. Show a Tk dialog asking the user for the
+    pairing code they generated in the PhantomTrace mobile app.
+    Retries on wrong / expired codes until the user cancels.
+
+    Returns (device_id, beacon_id) on success, or None on cancel.
+    """
+    try:
+        import tkinter as tk
+        from tkinter import ttk, messagebox
+    except Exception as e:
+        print(f"Tk unavailable for pairing dialog: {e}")
+        return None
+
+    result = {"device_id": None, "beacon_id": None}
+
+    def submit():
+        code = code_var.get().strip().upper()
+        if not code:
+            status_var.set("Please enter your pairing code."); return
+        submit_btn.configure(state="disabled")
+        status_var.set("Contacting server…")
+        root.update()
+        try:
+            r = requests.post(f"{BASE_URL}/api/device/pair",
+                              json={"code": code, "device_name": device_name},
+                              timeout=15)
+            if r.status_code == 201:
+                d = r.json()
+                result["device_id"] = d["device_id"]
+                result["beacon_id"] = d.get("beacon_id", "")
+                root.destroy()
+                return
+            err = "Pairing failed."
+            try: err = r.json().get("error", err)
+            except Exception: pass
+            status_var.set(f"✗ {err}")
+        except Exception as e:
+            status_var.set(f"✗ Network error: {e}")
+        finally:
+            submit_btn.configure(state="normal")
+
+    def cancel():
+        root.destroy()
+
+    root = tk.Tk()
+    root.title("PhantomTrace — Pair this device")
+    root.configure(bg="#0a0a0a")
+    root.geometry("520x360")
+    try: root.attributes("-topmost", True)
+    except Exception: pass
+
+    tk.Label(root, text="🔗 Pair this laptop with your PhantomTrace account",
+             font=("Segoe UI", 14, "bold"),
+             fg="#ff3b3b", bg="#0a0a0a",
+             wraplength=460, justify="center").pack(pady=(24, 6))
+
+    tk.Label(root,
+             text=("Open the PhantomTrace mobile app, tap “Add Device”, "
+                   "and copy the pairing code shown there."),
+             font=("Segoe UI", 10),
+             fg="#bbb", bg="#0a0a0a",
+             wraplength=460, justify="center").pack(pady=(0, 20))
+
+    tk.Label(root, text="Pairing code",
+             font=("Segoe UI", 11),
+             fg="#aaa", bg="#0a0a0a").pack()
+    code_var = tk.StringVar()
+    entry = tk.Entry(root, textvariable=code_var,
+                     font=("Consolas", 22, "bold"),
+                     justify="center", width=14,
+                     bg="#141414", fg="#fff",
+                     insertbackground="#fff", relief="flat")
+    entry.pack(pady=8, ipady=6)
+    entry.focus_set()
+
+    tk.Label(root, text=f"Device name: {device_name}",
+             font=("Segoe UI", 9),
+             fg="#666", bg="#0a0a0a").pack(pady=(6, 12))
+
+    status_var = tk.StringVar(value="")
+    tk.Label(root, textvariable=status_var,
+             font=("Segoe UI", 10),
+             fg="#ffaa00", bg="#0a0a0a",
+             wraplength=460, justify="center").pack()
+
+    btns = tk.Frame(root, bg="#0a0a0a"); btns.pack(pady=20)
+    submit_btn = tk.Button(btns, text="Pair", font=("Segoe UI", 11, "bold"),
+                           bg="#ff3b3b", fg="#fff",
+                           activebackground="#cc2222",
+                           relief="flat", padx=24, pady=8, command=submit)
+    submit_btn.pack(side="left", padx=8)
+    tk.Button(btns, text="Cancel", font=("Segoe UI", 11),
+              bg="#222", fg="#fff", relief="flat",
+              padx=18, pady=8, command=cancel).pack(side="left", padx=8)
+    root.bind("<Return>", lambda _e: submit())
+
+    root.mainloop()
+    return (result["device_id"], result["beacon_id"]) if result["device_id"] else None
+
+
 def get_or_register_device():
+    """
+    Returns (device_id, beacon_id).
+
+    Priority order:
+      1. Existing device.json — normal case, every launch after the first.
+      2. First launch with no device.json:
+         a) if a pairing code was supplied via env var PHANTOMTRACE_PAIR_CODE
+            (useful for scripted installs), pair silently
+         b) if PHANTOMTRACE_EMAIL is set AND the legacy self-register still
+            works, fall back to it (dev-mode single-user installs)
+         c) otherwise, prompt the user with a Tk dialog for the pairing
+            code they generated in the mobile app
+    """
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, 'r') as f:
             config = json.load(f)
@@ -106,21 +221,55 @@ def get_or_register_device():
         return config['device_id'], config.get('beacon_id', '')
 
     device_name = socket.gethostname()
-    # Pass the owner's email if you want the device linked to a specific account
-    # Set PHANTOMTRACE_EMAIL env var or hardcode here during deployment
+
+    # (2a) Silent pairing via env var (for scripted enterprise installs)
+    env_code = (os.getenv('PHANTOMTRACE_PAIR_CODE') or '').strip()
+    if env_code:
+        try:
+            r = requests.post(f"{BASE_URL}/api/device/pair",
+                              json={"code": env_code, "device_name": device_name},
+                              timeout=15)
+            if r.status_code == 201:
+                d = r.json()
+                with open(CONFIG_FILE, 'w') as f:
+                    json.dump({"device_id": d["device_id"],
+                               "beacon_id": d.get("beacon_id", ""),
+                               "user_id":   d.get("user_id", "")}, f)
+                print(f"Paired via env code: {d['device_id']}")
+                return d["device_id"], d.get("beacon_id", "")
+            print(f"Env-code pair failed: {r.status_code} {r.text[:120]}")
+        except Exception as e:
+            print(f"Env-code pair error: {e}")
+
+    # (2b) Legacy owner-email fallback for single-user dev installs
     owner_email = os.getenv('PHANTOMTRACE_EMAIL', '')
-    response = requests.post(f"{BASE_URL}/api/device/self-register",
-        json={"device_name": device_name, "owner_email": owner_email},
-        timeout=15)
-    if response.status_code == 201:
-        data = response.json()
-        device_id = data['device_id']
-        beacon_id = data.get('beacon_id', '')
-        with open(CONFIG_FILE, 'w') as f:
-            json.dump({"device_id": device_id, "beacon_id": beacon_id}, f)
-        print(f"Registered: {device_id} | beacon: {beacon_id}")
-        return device_id, beacon_id
-    raise Exception(f"Registration failed: {response.text}")
+    if owner_email:
+        try:
+            response = requests.post(f"{BASE_URL}/api/device/self-register",
+                json={"device_name": device_name, "owner_email": owner_email},
+                timeout=15)
+            if response.status_code == 201:
+                data = response.json()
+                device_id = data['device_id']
+                beacon_id = data.get('beacon_id', '')
+                with open(CONFIG_FILE, 'w') as f:
+                    json.dump({"device_id": device_id, "beacon_id": beacon_id}, f)
+                print(f"Registered (legacy self-register): {device_id}")
+                return device_id, beacon_id
+            print(f"Legacy self-register refused: {response.status_code} {response.text[:120]}")
+        except Exception as e:
+            print(f"Legacy self-register error: {e}")
+
+    # (2c) Show the pairing dialog
+    print("First launch — showing pairing dialog")
+    paired = _pair_via_dialog(device_name)
+    if not paired:
+        raise Exception("Pairing cancelled by user. Restart the agent to try again.")
+    device_id, beacon_id = paired
+    with open(CONFIG_FILE, 'w') as f:
+        json.dump({"device_id": device_id, "beacon_id": beacon_id}, f)
+    print(f"Paired: {device_id}")
+    return device_id, beacon_id
 
 # ── System information reporters ───────────────────────────────────────────────
 def send_system_info(device_id):
