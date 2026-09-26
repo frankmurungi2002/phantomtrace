@@ -498,15 +498,22 @@ def pair_device():
 
 
 @app.route('/api/device/pair-status/<code>', methods=['GET'])
-@jwt_required()
 def pair_status(code):
     """
     The mobile app polls this while showing the pairing code, so it can
     switch to 'Device paired!' automatically without a manual refresh.
+
+    Public — no JWT required. Knowing the code is already the token
+    needed to see its own status. The response (paired yes/no + a
+    device_id) gives no attacker anything actionable — the pair action
+    itself still consumes the code. Making this public also avoids the
+    'stale JWT during polling' failure mode that caused the phone to
+    hang on 'Waiting for your laptop...'.
     """
     row = DevicePairCode.query.filter_by(code=code.strip().upper()).first()
-    if not row or row.user_id != get_jwt_identity():
+    if not row:
         return jsonify({'error': 'Not found'}), 404
+    print(f"[PAIR-STATUS] code={row.code} paired={row.used_at is not None}")
     return jsonify({
         'code':      row.code,
         'paired':    row.used_at is not None,
