@@ -2785,6 +2785,58 @@ with app.app_context():
             print(f"Migration warning (users {_col}): {_mig_err6}")
     print("Migration: users 2FA + password_reset columns ensured")
 
+    # v1 — Legal acceptance columns on users (Terms + Privacy).
+    # WITHOUT these, signup crashes with a 500 because INSERT references
+    # columns the existing table doesn't have yet.
+    for _col in ("legal_accepted_at TIMESTAMP",
+                 "legal_version VARCHAR(20)"):
+        try:
+            db.session.execute(db.text(
+                f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {_col}"))
+            db.session.commit()
+        except Exception as _mig_err7:
+            db.session.rollback()
+            print(f"Migration warning (users {_col}): {_mig_err7}")
+    print("Migration: users legal_accepted_at + legal_version ensured")
+
+    # v1 — BIOS wizard columns on devices.
+    for _col in ("bios_manufacturer VARCHAR(80)",
+                 "bios_model VARCHAR(120)",
+                 "bios_enter_key VARCHAR(60)",
+                 "bios_fallback_key VARCHAR(80)",
+                 "bios_steps_json TEXT",
+                 "bios_protected BOOLEAN DEFAULT FALSE",
+                 "bios_protected_at TIMESTAMP"):
+        try:
+            db.session.execute(db.text(
+                f"ALTER TABLE devices ADD COLUMN IF NOT EXISTS {_col}"))
+            db.session.commit()
+        except Exception as _mig_err8:
+            db.session.rollback()
+            print(f"Migration warning (devices {_col}): {_mig_err8}")
+    print("Migration: devices BIOS columns ensured")
+
+    # v1 — EmergencyContact table. db.create_all() usually makes it, but we
+    # add a safety-net raw CREATE TABLE IF NOT EXISTS so we're resilient
+    # against first-boot ordering issues or metadata caches.
+    try:
+        db.session.execute(db.text("""
+            CREATE TABLE IF NOT EXISTS emergency_contacts (
+                id            VARCHAR(36) PRIMARY KEY,
+                user_id       VARCHAR(36) NOT NULL REFERENCES users(id),
+                name          VARCHAR(120) NOT NULL,
+                email         VARCHAR(120),
+                phone         VARCHAR(30),
+                relationship  VARCHAR(60),
+                created_at    TIMESTAMP
+            )
+        """))
+        db.session.commit()
+    except Exception as _mig_err9:
+        db.session.rollback()
+        print(f"Migration warning (emergency_contacts): {_mig_err9}")
+    print("Migration: emergency_contacts table ensured")
+
 
 @app.route('/api/device/self-register', methods=['POST'])
 def self_register():
