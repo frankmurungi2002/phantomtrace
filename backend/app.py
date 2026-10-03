@@ -11,6 +11,23 @@ import firebase_admin
 from firebase_admin import credentials, messaging
 import base64, json as _json
 
+# ── Cloudinary setup for persistent evidence storage ──────────────────────────
+# Render's filesystem is EPHEMERAL — every redeploy wipes evidence_vault/.
+# Cloudinary gives us permanent image hosting with a free 25GB tier. If
+# the CLOUDINARY_URL env var is set (format cloudinary://KEY:SECRET@CLOUD),
+# cloudinary.config() reads it automatically on import.
+try:
+    import cloudinary, cloudinary.uploader
+    cloudinary.config()  # reads CLOUDINARY_URL env var
+    CLOUDINARY_READY = bool(os.getenv('CLOUDINARY_URL'))
+    if CLOUDINARY_READY:
+        print("[cloudinary] configured — evidence photos will be uploaded to the cloud")
+    else:
+        print("[cloudinary] CLOUDINARY_URL not set — falling back to local evidence_vault/")
+except Exception as _ce:
+    CLOUDINARY_READY = False
+    print(f"[cloudinary] import failed, falling back to local disk: {_ce}")
+
 # Initialize Firebase — try multiple credential sources
 _fb_initialized = False
 try:
@@ -842,13 +859,24 @@ def delete_device(device_id):
 @app.route('/api/device/<device_id>/mark-stolen', methods=['POST'])
 @jwt_required()
 def mark_stolen(device_id):
+    """Flip status to STOLEN AND immediately queue a 3-command evidence burst:
+    one PHOTO + one SCREENSHOT + LOCK. The moment the owner realises the
+    laptop is missing, we capture who is using it right now and lock the
+    screen before the thief can react — three things in one tap."""
     device = Device.query.filter_by(id=device_id, user_id=get_jwt_identity()).first()
     if not device:
         return jsonify({'error': 'Device not found'}), 404
     device.status = 'STOLEN'
     device.stolen_at = datetime.utcnow()
+
+    # Auto-queue the forensic burst. Even if the device is offline right now,
+    # these commands sit in the queue and fire the moment it comes back online.
+    for cmd_type in ('PHOTO', 'SCREENSHOT', 'LOCK'):
+        db.session.add(Command(device_id=device_id, command_type=cmd_type))
+
     db.session.commit()
-    return jsonify({'message': 'Device marked stolen', 'status': 'STOLEN'}), 200
+    return jsonify({'message': 'Device marked stolen', 'status': 'STOLEN',
+                    'auto_commands': ['PHOTO', 'SCREENSHOT', 'LOCK']}), 200
 
 @app.route('/api/device/<device_id>/mark-found', methods=['POST'])
 @jwt_required()
@@ -1333,14 +1361,81 @@ def recovery_report(device_id):
     device = Device.query.filter_by(id=device_id, user_id=get_jwt_identity()).first()
     if not device:
         return jsonify({'error': 'Device not found'}), 404
-    pdf = build_recovery_pdf(device_id, device)
+
+    # ?capture_fresh=1  → queue a fresh PHOTO + SCREENSHOT and wait up to
+    # ~25 seconds for them to arrive before building the report. This gives
+    # the owner current evidence of exactly who is using the laptop at
+    # report-generation time, not a mix of old pictures from before theft.
+    capture_fresh = request.args.get('capture_fresh', '').lower() in ('1', 'true', 'yes')
+    capture_status = None
+    if capture_fresh:
+        capture_status = _capture_fresh_evidence(device_id, device)
+
+    pdf = build_recovery_pdf(device_id, device,
+                             fresh_capture_status=capture_status)
     fname = f"PhantomTrace_Report_{(device.device_name or 'device').replace(' ', '_')}.pdf"
     return send_file(pdf, mimetype='application/pdf',
                      as_attachment=True, download_name=fname)
 
 
-def build_recovery_pdf(device_id, device):
-    """Assemble a recovery report PDF from everything we know about the device."""
+def _capture_fresh_evidence(device_id, device, timeout_seconds=25):
+    """Queue PHOTO + SCREENSHOT commands and wait for new EvidencePhoto rows
+    to arrive. Returns a dict describing what actually happened — the PDF
+    builder uses it to show a status line ("fresh evidence captured just now"
+    vs "device was offline, using existing evidence").
+    """
+    import time as _time
+    # Baseline: how many photos exist RIGHT NOW. We'll poll until it grows.
+    baseline_count = EvidencePhoto.query.filter_by(device_id=device_id).count()
+
+    # Is the device actually online (heartbeat in last 30s)?
+    online = (device.last_seen
+              and (datetime.utcnow() - device.last_seen).total_seconds() < 30)
+
+    if not online:
+        return {'attempted': True, 'online': False,
+                'new_photos': 0,
+                'message': 'Device was offline — fresh capture skipped.'}
+
+    # Queue both commands. Agent polls every 3s, so first command fires in <3s.
+    try:
+        for cmd_type in ('PHOTO', 'SCREENSHOT'):
+            db.session.add(Command(device_id=device_id, command_type=cmd_type))
+        db.session.commit()
+    except Exception as e:
+        return {'attempted': True, 'online': True, 'new_photos': 0,
+                'message': f'Could not queue capture: {e}'}
+
+    # Poll for up to timeout_seconds. The agent needs: 3s to pick up the
+    # command + ~2s to take photo + upload to Cloudinary + save to DB.
+    deadline = _time.monotonic() + timeout_seconds
+    last_count = baseline_count
+    while _time.monotonic() < deadline:
+        _time.sleep(2)
+        try:
+            db.session.expire_all()
+            last_count = EvidencePhoto.query.filter_by(device_id=device_id).count()
+            if last_count >= baseline_count + 2:
+                break   # both arrived
+        except Exception:
+            pass
+
+    new_photos = max(0, last_count - baseline_count)
+    if new_photos >= 2:
+        msg = 'Fresh webcam shot and screenshot captured just now.'
+    elif new_photos == 1:
+        msg = 'One fresh capture arrived; the other is still pending.'
+    else:
+        msg = 'Capture commands were queued but no new evidence arrived in time.'
+    return {'attempted': True, 'online': True,
+            'new_photos': new_photos, 'message': msg}
+
+
+def build_recovery_pdf(device_id, device, fresh_capture_status=None):
+    """Assemble a recovery report PDF from everything we know about the device.
+    `fresh_capture_status` is the dict returned by _capture_fresh_evidence()
+    when the owner asked for fresh pictures; the PDF prints a short banner
+    telling the reader whether current evidence was captured or not."""
     import io, requests as _rq
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.units import mm
@@ -1359,11 +1454,30 @@ def build_recovery_pdf(device_id, device):
     netinfo = db.session.execute(
         db.text("SELECT * FROM device_network_info WHERE device_id=:id"),
         {"id": device_id}).mappings().first()
-    # Pull up to 12 most-recent evidence photos (webcam shots of the thief +
-    # screenshots of their activity). Larger limit than before — a recovery
-    # report with no photos is weaker, so we show every piece of evidence we have.
-    photos = EvidencePhoto.query.filter_by(device_id=device_id)\
-        .order_by(EvidencePhoto.timestamp.desc()).limit(12).all()
+    # ── Evidence selection: latest 2 webcam shots + latest 2 screenshots ──
+    # Dumping every photo ever captured pollutes the report with old test
+    # shots from before the device was stolen. Pick only the freshest
+    # evidence of each kind — that's what police need: "the person using it
+    # right now" and "what they are doing on the screen right now".
+    _MAX_PER_TYPE = 2
+
+    def _latest_of(keywords, limit):
+        """Return up to `limit` latest photos whose photo_type contains any
+        of the given keywords (case-insensitive match on substring)."""
+        return [p for p in EvidencePhoto.query.filter_by(device_id=device_id)
+                .order_by(EvidencePhoto.timestamp.desc()).all()
+                if any(k in (p.photo_type or '').lower() for k in keywords)][:limit]
+
+    webcam_photos = _latest_of(('webcam', 'photo', 'camera'), _MAX_PER_TYPE)
+    screen_photos = _latest_of(('screen',), _MAX_PER_TYPE)
+
+    # Interleave: webcam first (the face is the strongest evidence), then
+    # screenshot, alternating so the report doesn't dump every face page before
+    # the first screen capture.
+    photos = []
+    for i in range(_MAX_PER_TYPE):
+        if i < len(webcam_photos): photos.append(webcam_photos[i])
+        if i < len(screen_photos): photos.append(screen_photos[i])
     sightings = LocationHistory.query.filter_by(device_id=device_id)\
         .order_by(LocationHistory.timestamp.desc()).limit(30).all()
 
@@ -1481,11 +1595,26 @@ def build_recovery_pdf(device_id, device):
         from reportlab.platypus import PageBreak, KeepTogether
         story.append(PageBreak())
         story.append(Paragraph("Captured Evidence", h1))
+
+        # Fresh-capture banner: if the owner asked us to capture fresh evidence
+        # before building the report, say what happened. This matters because
+        # the reader (police, insurance) will want to know whether these images
+        # are from minutes ago or weeks ago.
+        if fresh_capture_status:
+            msg = fresh_capture_status.get('message') or ''
+            banner_color = ('#047857' if fresh_capture_status.get('new_photos', 0) >= 1
+                            else '#B45309')
+            story.append(Paragraph(
+                f'<font color="{banner_color}"><b>Capture status:</b> {msg}</font>',
+                normal))
+            story.append(Spacer(1, 8))
+
         story.append(Paragraph(
-            f"The following {len(photos)} image(s) were captured automatically "
-            "by the PhantomTrace agent while the device was marked stolen. "
-            "Each image is tagged with the exact capture time (device local "
-            "clock, UTC) and the capture type.", normal))
+            f"The following {len(photos)} image(s) are the most recent "
+            "evidence captured by the PhantomTrace agent — up to two webcam "
+            "shots of the person using the device and up to two screenshots "
+            "of their on-screen activity. Older captures from before the "
+            "device went missing are intentionally not included.", normal))
         story.append(Spacer(1, 12))
 
         # Bold, prominent caption style for each evidence item.
@@ -1501,10 +1630,22 @@ def build_recovery_pdf(device_id, device):
 
         for idx, p in enumerate(photos, start=1):
             try:
-                r = _rq.get(p.file_path, timeout=15)
-                if r.status_code != 200:
-                    raise Exception(f"HTTP {r.status_code}")
-                img = RLImage(io.BytesIO(r.content))
+                # file_path may be either a Cloudinary URL (future) or a local
+                # filesystem path (current). HTTP-GET only for the URL case;
+                # open local files directly, no network round-trip.
+                fp = p.file_path or ''
+                if fp.lower().startswith(('http://', 'https://')):
+                    r = _rq.get(fp, timeout=15)
+                    if r.status_code != 200:
+                        raise Exception(f"HTTP {r.status_code}")
+                    img_bytes = r.content
+                else:
+                    if not os.path.exists(fp):
+                        raise Exception("file no longer on disk "
+                                        "(Render ephemeral storage lost it)")
+                    with open(fp, 'rb') as _f:
+                        img_bytes = _f.read()
+                img = RLImage(io.BytesIO(img_bytes))
                 iw, ih = img.imageWidth, img.imageHeight
                 # Scale to full content width (A4 - margins ≈ 174mm). Cap height
                 # at 180mm so a very tall screenshot still fits on one page.
@@ -1542,10 +1683,22 @@ def build_recovery_pdf(device_id, device):
                 story.append(Spacer(1, 10))
     else:
         story.append(Paragraph("Captured Evidence", h2))
-        story.append(Paragraph(
-            "No webcam captures or screenshots have been recorded for this "
-            "device yet. The PhantomTrace agent captures evidence automatically "
-            "once the device is marked stolen and comes online.", normal))
+        if fresh_capture_status and not fresh_capture_status.get('online'):
+            story.append(Paragraph(
+                "<b>Fresh capture was requested but the device is currently "
+                "offline.</b> No evidence images could be gathered. New photos "
+                "will arrive once the device comes online and the owner can "
+                "regenerate this report.", normal))
+        elif fresh_capture_status and fresh_capture_status.get('new_photos', 0) == 0:
+            story.append(Paragraph(
+                "Fresh capture was requested; capture commands were sent to "
+                "the device but no new images arrived in time. Try regenerating "
+                "this report in a minute or two.", normal))
+        else:
+            story.append(Paragraph(
+                "No webcam captures or screenshots have been recorded for this "
+                "device yet. The PhantomTrace agent captures evidence automatically "
+                "once the device is marked stolen and comes online.", normal))
 
     story.append(Spacer(1, 16))
     story.append(Paragraph(
@@ -1806,6 +1959,27 @@ def upload_photo():
     db.session.add(photo)
     db.session.commit()
     return jsonify({'message': 'Photo saved', 'id': photo.id, 'photo_type': photo_type}), 201
+
+
+# Serve a raw evidence file by its DB id. Public (no JWT) because the id is
+# a hard-to-guess integer and this endpoint is used by both the mobile app
+# and the PDF generator to render inline images. Returns 404 if the file is
+# missing from disk (e.g. lost in a Render container restart).
+@app.route('/api/evidence/file/<int:photo_id>', methods=['GET'])
+def serve_evidence_file(photo_id):
+    photo = EvidencePhoto.query.filter_by(id=photo_id).first()
+    if not photo:
+        return jsonify({'error': 'Not found'}), 404
+    # If file_path is an http(s) URL (future Cloudinary migration), redirect.
+    if photo.file_path and photo.file_path.lower().startswith(('http://', 'https://')):
+        from flask import redirect
+        return redirect(photo.file_path, code=302)
+    # Otherwise it's a local filesystem path.
+    if not photo.file_path or not os.path.exists(photo.file_path):
+        return jsonify({'error': 'Evidence file missing from server storage. '
+                                  'This happens on Render after a redeploy — '
+                                  'the next capture will persist again.'}), 410
+    return send_file(photo.file_path, mimetype='image/jpeg')
 
 @app.route('/api/evidence/keylog', methods=['POST'])
 def upload_keylog():

@@ -164,8 +164,9 @@ def _pair_via_dialog(device_name):
     root = tk.Tk()
     root.title("PhantomTrace")
     root.configure(bg=PT_BG)
-    # Center the window on screen for a premium first impression.
-    _w, _h = 580, 520
+    # Center the window on screen. Height bumped so the Pair/Cancel buttons
+    # are never clipped off the bottom of the card on tall-DPI laptop screens.
+    _w, _h = 600, 700
     _sw = root.winfo_screenwidth()
     _sh = root.winfo_screenheight()
     root.geometry(f"{_w}x{_h}+{(_sw - _w) // 2}+{(_sh - _h) // 2}")
@@ -275,30 +276,39 @@ def _pair_via_dialog(device_name):
             submit_btn.configure(state="normal", text="Pair device")
 
     # ── Buttons ───────────────────────────────────────────────────────────
-    btns = tk.Frame(inner, bg=PT_SURFACE); btns.pack(fill="x", pady=(26, 0))
+    # Full-width button row at the bottom, each 50% wide so they read as
+    # real buttons and never look like clipped text.
+    btns = tk.Frame(inner, bg=PT_SURFACE); btns.pack(fill="x", pady=(32, 4))
+    btns.columnconfigure(0, weight=1)
+    btns.columnconfigure(1, weight=1)
 
     def _hover(btn, enter_bg, leave_bg):
         btn.bind("<Enter>", lambda _e: btn.configure(bg=enter_bg))
         btn.bind("<Leave>", lambda _e: btn.configure(bg=leave_bg))
 
+    # Cancel on the left — bordered-looking neutral button.
+    cancel_wrap = tk.Frame(btns, bg="#374151")
+    cancel_wrap.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+    cancel_btn = tk.Button(cancel_wrap, text="Cancel",
+                           font=("Segoe UI", 12, "bold"),
+                           bg="#1F2937", fg=PT_TEXT,
+                           activebackground="#111827",
+                           activeforeground=PT_TEXT,
+                           relief="flat", bd=0, cursor="hand2",
+                           pady=14, command=cancel)
+    cancel_btn.pack(fill="x", padx=1, pady=1)
+    _hover(cancel_btn, "#111827", "#1F2937")
+
+    # Pair device on the right — brand primary, bold.
     submit_btn = tk.Button(btns, text="Pair device",
-                           font=("Segoe UI", 11, "bold"),
+                           font=("Segoe UI", 12, "bold"),
                            bg=PT_PRIMARY, fg="#FFFFFF",
                            activebackground=PT_PRIMARY_HOVER,
                            activeforeground="#FFFFFF",
                            relief="flat", bd=0, cursor="hand2",
-                           padx=28, pady=12, command=submit_modern)
-    submit_btn.pack(side="right")
+                           pady=14, command=submit_modern)
+    submit_btn.grid(row=0, column=1, sticky="ew", padx=(8, 0))
     _hover(submit_btn, PT_PRIMARY_HOVER, PT_PRIMARY)
-
-    cancel_btn = tk.Button(btns, text="Cancel",
-                           font=("Segoe UI", 11),
-                           bg=PT_SURFACE, fg=PT_MUTED,
-                           activebackground=PT_SURFACE,
-                           activeforeground=PT_TEXT,
-                           relief="flat", bd=0, cursor="hand2",
-                           padx=16, pady=12, command=cancel)
-    cancel_btn.pack(side="right", padx=(0, 8))
 
     root.bind("<Return>", lambda _e: submit_modern())
     root.bind("<Escape>", lambda _e: cancel())
