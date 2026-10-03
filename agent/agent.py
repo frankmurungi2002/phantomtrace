@@ -144,58 +144,166 @@ def _pair_via_dialog(device_name):
     def cancel():
         root.destroy()
 
+    # ── Premium dark-themed pairing dialog, visually matching the mobile app ──
+    # Design language:
+    #   • Deep #0A0A0A background with a #141A2E surface card
+    #   • Crimson #DC2626 primary (same as mobile AppColors.primary)
+    #   • Segoe UI (fallback to Arial) weighted for hierarchy
+    #   • Large monospace code entry with 8px letter-spacing feel
+    #   • Status row for inline errors/progress, not modal popups
+    PT_BG      = "#0A0A0A"
+    PT_SURFACE = "#141A2E"
+    PT_MUTED   = "#9CA3AF"
+    PT_SUBTLE  = "#6B7280"
+    PT_PRIMARY = "#DC2626"
+    PT_PRIMARY_HOVER = "#B91C1C"
+    PT_TEXT    = "#F3F4F6"
+    PT_SUCCESS = "#10B981"
+    PT_WARN    = "#F59E0B"
+
     root = tk.Tk()
-    root.title("PhantomTrace — Pair this device")
-    root.configure(bg="#0a0a0a")
-    root.geometry("520x360")
+    root.title("PhantomTrace")
+    root.configure(bg=PT_BG)
+    # Center the window on screen for a premium first impression.
+    _w, _h = 580, 520
+    _sw = root.winfo_screenwidth()
+    _sh = root.winfo_screenheight()
+    root.geometry(f"{_w}x{_h}+{(_sw - _w) // 2}+{(_sh - _h) // 2}")
+    root.resizable(False, False)
     try: root.attributes("-topmost", True)
     except Exception: pass
 
-    tk.Label(root, text="🔗 Pair this laptop with your PhantomTrace account",
-             font=("Segoe UI", 14, "bold"),
-             fg="#ff3b3b", bg="#0a0a0a",
-             wraplength=460, justify="center").pack(pady=(24, 6))
+    # Outer padding frame — matches the 24px margin style of the mobile app.
+    outer = tk.Frame(root, bg=PT_BG)
+    outer.pack(expand=True, fill="both", padx=28, pady=28)
 
-    tk.Label(root,
-             text=("Open the PhantomTrace mobile app, tap “Add Device”, "
-                   "and copy the pairing code shown there."),
+    # ── Logo + brand row ──────────────────────────────────────────────────
+    brand = tk.Frame(outer, bg=PT_BG)
+    brand.pack(fill="x", pady=(0, 20))
+    tk.Label(brand, text="◆",
+             font=("Segoe UI", 22, "bold"),
+             fg=PT_PRIMARY, bg=PT_BG).pack(side="left")
+    tk.Label(brand, text="  PHANTOMTRACE",
+             font=("Segoe UI", 15, "bold"),
+             fg=PT_TEXT, bg=PT_BG).pack(side="left")
+
+    # ── Surface card ──────────────────────────────────────────────────────
+    card = tk.Frame(outer, bg=PT_SURFACE)
+    card.pack(fill="both", expand=True, ipadx=4, ipady=4)
+    inner = tk.Frame(card, bg=PT_SURFACE)
+    inner.pack(fill="both", expand=True, padx=28, pady=28)
+
+    tk.Label(inner, text="PAIR THIS LAPTOP",
+             font=("Segoe UI", 10, "bold"),
+             fg=PT_MUTED, bg=PT_SURFACE).pack(anchor="w")
+    tk.Label(inner, text="Link this device to your account",
+             font=("Segoe UI", 18, "bold"),
+             fg=PT_TEXT, bg=PT_SURFACE,
+             wraplength=460, justify="left").pack(anchor="w", pady=(4, 14))
+
+    tk.Label(inner,
+             text=("Open PhantomTrace on your phone and tap \"Add device\".\n"
+                   "You'll see a one-time pairing code. Type it below."),
              font=("Segoe UI", 10),
-             fg="#bbb", bg="#0a0a0a",
-             wraplength=460, justify="center").pack(pady=(0, 20))
+             fg=PT_MUTED, bg=PT_SURFACE,
+             wraplength=460, justify="left").pack(anchor="w", pady=(0, 22))
 
-    tk.Label(root, text="Pairing code",
-             font=("Segoe UI", 11),
-             fg="#aaa", bg="#0a0a0a").pack()
+    # ── Pairing-code field ────────────────────────────────────────────────
+    tk.Label(inner, text="PAIRING CODE",
+             font=("Segoe UI", 9, "bold"),
+             fg=PT_MUTED, bg=PT_SURFACE).pack(anchor="w")
+
+    # Simulate a bordered input: a thin frame around a flat entry.
+    code_wrap = tk.Frame(inner, bg="#1F2937", highlightthickness=1,
+                         highlightbackground="#374151",
+                         highlightcolor=PT_PRIMARY)
+    code_wrap.pack(fill="x", pady=(8, 4))
     code_var = tk.StringVar()
-    entry = tk.Entry(root, textvariable=code_var,
-                     font=("Consolas", 22, "bold"),
-                     justify="center", width=14,
-                     bg="#141414", fg="#fff",
-                     insertbackground="#fff", relief="flat")
-    entry.pack(pady=8, ipady=6)
+    entry = tk.Entry(code_wrap, textvariable=code_var,
+                     font=("Consolas", 26, "bold"),
+                     justify="center",
+                     bg="#1F2937", fg=PT_TEXT,
+                     insertbackground=PT_PRIMARY, relief="flat",
+                     bd=0)
+    entry.pack(fill="x", padx=14, pady=14)
     entry.focus_set()
 
-    tk.Label(root, text=f"Device name: {device_name}",
+    tk.Label(inner, text=f"Device name:  {device_name}",
              font=("Segoe UI", 9),
-             fg="#666", bg="#0a0a0a").pack(pady=(6, 12))
+             fg=PT_SUBTLE, bg=PT_SURFACE).pack(anchor="w", pady=(12, 6))
 
+    # ── Inline status row ─────────────────────────────────────────────────
     status_var = tk.StringVar(value="")
-    tk.Label(root, textvariable=status_var,
-             font=("Segoe UI", 10),
-             fg="#ffaa00", bg="#0a0a0a",
-             wraplength=460, justify="center").pack()
+    status_lbl = tk.Label(inner, textvariable=status_var,
+             font=("Segoe UI", 10, "bold"),
+             fg=PT_WARN, bg=PT_SURFACE,
+             wraplength=460, justify="left")
+    status_lbl.pack(anchor="w", pady=(6, 0))
 
-    btns = tk.Frame(root, bg="#0a0a0a"); btns.pack(pady=20)
-    submit_btn = tk.Button(btns, text="Pair", font=("Segoe UI", 11, "bold"),
-                           bg="#ff3b3b", fg="#fff",
-                           activebackground="#cc2222",
-                           relief="flat", padx=24, pady=8, command=submit)
-    submit_btn.pack(side="left", padx=8)
-    tk.Button(btns, text="Cancel", font=("Segoe UI", 11),
-              bg="#222", fg="#fff", relief="flat",
-              padx=18, pady=8, command=cancel).pack(side="left", padx=8)
-    root.bind("<Return>", lambda _e: submit())
+    # Give submit() access to the status label so it can color-switch
+    def set_status(msg, color=PT_WARN):
+        status_var.set(msg); status_lbl.configure(fg=color)
 
+    # Rewire submit() to use the modern status helper and color codes
+    def submit_modern():
+        code = code_var.get().strip().upper()
+        if not code:
+            set_status("Enter the pairing code shown on your phone.", PT_WARN)
+            return
+        submit_btn.configure(state="disabled", text="Pairing…")
+        set_status("Contacting server…", PT_MUTED)
+        root.update()
+        try:
+            r = requests.post(f"{BASE_URL}/api/device/pair",
+                              json={"code": code, "device_name": device_name},
+                              timeout=15)
+            if r.status_code == 201:
+                d = r.json()
+                result["device_id"] = d["device_id"]
+                result["beacon_id"] = d.get("beacon_id", "")
+                set_status("✓ Paired — welcome to PhantomTrace.", PT_SUCCESS)
+                root.update()
+                root.after(900, root.destroy)
+                return
+            err = "Pairing failed."
+            try: err = r.json().get("error", err)
+            except Exception: pass
+            set_status(f"✗ {err}", PT_PRIMARY)
+        except Exception as e:
+            set_status(f"✗ Network error: {e}", PT_PRIMARY)
+        finally:
+            submit_btn.configure(state="normal", text="Pair device")
+
+    # ── Buttons ───────────────────────────────────────────────────────────
+    btns = tk.Frame(inner, bg=PT_SURFACE); btns.pack(fill="x", pady=(26, 0))
+
+    def _hover(btn, enter_bg, leave_bg):
+        btn.bind("<Enter>", lambda _e: btn.configure(bg=enter_bg))
+        btn.bind("<Leave>", lambda _e: btn.configure(bg=leave_bg))
+
+    submit_btn = tk.Button(btns, text="Pair device",
+                           font=("Segoe UI", 11, "bold"),
+                           bg=PT_PRIMARY, fg="#FFFFFF",
+                           activebackground=PT_PRIMARY_HOVER,
+                           activeforeground="#FFFFFF",
+                           relief="flat", bd=0, cursor="hand2",
+                           padx=28, pady=12, command=submit_modern)
+    submit_btn.pack(side="right")
+    _hover(submit_btn, PT_PRIMARY_HOVER, PT_PRIMARY)
+
+    cancel_btn = tk.Button(btns, text="Cancel",
+                           font=("Segoe UI", 11),
+                           bg=PT_SURFACE, fg=PT_MUTED,
+                           activebackground=PT_SURFACE,
+                           activeforeground=PT_TEXT,
+                           relief="flat", bd=0, cursor="hand2",
+                           padx=16, pady=12, command=cancel)
+    cancel_btn.pack(side="right", padx=(0, 8))
+
+    root.bind("<Return>", lambda _e: submit_modern())
+    root.bind("<Escape>", lambda _e: cancel())
+
+    # Replace the plain submit() with submit_modern — don't keep the old one bound.
     root.mainloop()
     return (result["device_id"], result["beacon_id"]) if result["device_id"] else None
 
@@ -215,10 +323,24 @@ def get_or_register_device():
             code they generated in the mobile app
     """
     if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, 'r') as f:
-            config = json.load(f)
-        print(f"Device ID: {config['device_id']}")
-        return config['device_id'], config.get('beacon_id', '')
+        # Sanity check: a stale/empty/corrupt device.json would silently skip
+        # the pairing dialog and leave the agent registered to nobody.
+        # Treat a missing or empty device_id as "not paired" and fall through
+        # to the pairing dialog instead.
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                config = json.load(f)
+            dev_id = (config or {}).get('device_id', '').strip()
+            if dev_id:
+                print(f"Device ID: {dev_id}")
+                return dev_id, config.get('beacon_id', '')
+            print("device.json exists but has no device_id — reprompting for pairing.")
+            try: os.remove(CONFIG_FILE)
+            except Exception: pass
+        except Exception as e:
+            print(f"device.json unreadable ({e}) — reprompting for pairing.")
+            try: os.remove(CONFIG_FILE)
+            except Exception: pass
 
     device_name = socket.gethostname()
 
