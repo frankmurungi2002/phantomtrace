@@ -182,6 +182,16 @@ class Device(db.Model):
     bitlocker_key_id       = db.Column(db.String(40))    # GUID of our protector
     bitlocker_recovery_key = db.Column(db.String(80))    # 48-digit recovery key
     bitlocker_updated_at   = db.Column(db.DateTime)
+    # BIOS protection wizard — the owner confirms they set a BIOS password
+    # that blocks USB boot. The dashboard shows a yellow warning badge
+    # until this is marked true.
+    bios_manufacturer = db.Column(db.String(80))
+    bios_model        = db.Column(db.String(120))
+    bios_enter_key    = db.Column(db.String(60))
+    bios_fallback_key = db.Column(db.String(80))
+    bios_steps_json   = db.Column(db.Text)       # list[str] JSON
+    bios_protected    = db.Column(db.Boolean, default=False)
+    bios_protected_at = db.Column(db.DateTime)
 
 class Sighting(db.Model):
     __tablename__ = 'sightings'
@@ -842,7 +852,11 @@ def list_devices():
             'device_name': d.device_name,
             'status': d.status,
             'online': online,
-            'last_seen': d.last_seen.isoformat() if d.last_seen else None
+            'last_seen': d.last_seen.isoformat() if d.last_seen else None,
+            # Dashboard needs these to render the yellow BIOS warning badge.
+            'bios_protected': bool(d.bios_protected),
+            'bios_manufacturer': d.bios_manufacturer,
+            'bios_model': d.bios_model,
         })
     return jsonify({'devices': result}), 200
 
@@ -869,6 +883,71 @@ def delete_device(device_id):
     db.session.delete(device)
     db.session.commit()
     return jsonify({'message': f'"{device_name}" deleted'}), 200
+
+
+# ── BIOS protection reporting ─────────────────────────────────────────────
+# Agent reports its laptop model + the matching BIOS instructions. Owner
+# confirms via the mobile app once they've set a BIOS password + locked
+# USB boot. Public: no JWT needed, device_id is the proof — this endpoint
+# only writes columns, no sensitive data is returned.
+@app.route('/api/device/bios-info', methods=['POST'])
+def report_bios_info():
+    data = request.get_json() or {}
+    device_id = data.get('device_id')
+    if not device_id:
+        return jsonify({'error': 'Missing device_id'}), 400
+    device = Device.query.filter_by(id=device_id).first()
+    if not device:
+        return jsonify({'error': 'Device not found'}), 404
+    device.bios_manufacturer = (data.get('manufacturer') or '')[:80]
+    device.bios_model        = (data.get('model') or '')[:120]
+    device.bios_enter_key    = (data.get('enter_key') or '')[:60]
+    device.bios_fallback_key = (data.get('fallback_key') or '')[:80]
+    steps = data.get('steps') or []
+    try:
+        device.bios_steps_json = _json.dumps(steps[:12])   # cap size
+    except Exception:
+        device.bios_steps_json = None
+    db.session.commit()
+    return jsonify({'message': 'BIOS info stored'}), 200
+
+
+# Mobile app reads this to show the setup wizard for a device.
+@app.route('/api/device/<device_id>/bios-info', methods=['GET'])
+@jwt_required()
+def get_bios_info(device_id):
+    device = Device.query.filter_by(id=device_id, user_id=get_jwt_identity()).first()
+    if not device:
+        return jsonify({'error': 'Device not found'}), 404
+    try:
+        steps = _json.loads(device.bios_steps_json or '[]')
+    except Exception:
+        steps = []
+    return jsonify({
+        'manufacturer': device.bios_manufacturer,
+        'model': device.bios_model,
+        'enter_key': device.bios_enter_key,
+        'fallback_key': device.bios_fallback_key,
+        'steps': steps,
+        'protected': bool(device.bios_protected),
+        'protected_at': device.bios_protected_at.isoformat() if device.bios_protected_at else None,
+    }), 200
+
+
+# Owner marks "I've set my BIOS password".
+@app.route('/api/device/<device_id>/bios-protected', methods=['POST'])
+@jwt_required()
+def set_bios_protected(device_id):
+    device = Device.query.filter_by(id=device_id, user_id=get_jwt_identity()).first()
+    if not device:
+        return jsonify({'error': 'Device not found'}), 404
+    data = request.get_json() or {}
+    protected = bool(data.get('protected', True))
+    device.bios_protected = protected
+    device.bios_protected_at = datetime.utcnow() if protected else None
+    db.session.commit()
+    return jsonify({'message': 'BIOS protection status updated',
+                    'protected': protected}), 200
 
 
 # ── Emergency contacts: CRUD endpoints ────────────────────────────────────
@@ -1060,10 +1139,15 @@ def mark_stolen(device_id):
 
     # Auto-queue the forensic burst. Even if the device is offline right now,
     # these commands sit in the queue and fire the moment it comes back online.
-    # ENABLE_BITLOCKER enforces full-disk encryption so the thief can't boot
-    # the laptop from USB and read the SSD contents — once BitLocker is on,
-    # that drive is a brick without the recovery key (which we escrow in the DB).
-    for cmd_type in ('PHOTO', 'SCREENSHOT', 'LOCK', 'ENABLE_BITLOCKER'):
+    #   PHOTO + SCREENSHOT      — immediate evidence of who's using it
+    #   LOCK                    — screen lock
+    #   USB_LOCKDOWN            — disable USB mass storage, blocks data
+    #                             exfiltration + USB-tool execution while
+    #                             the thief is logged in
+    #   ENABLE_BITLOCKER        — full-disk encryption so even if they wipe
+    #                             the drive, your data is cryptographically gone
+    for cmd_type in ('PHOTO', 'SCREENSHOT', 'LOCK',
+                     'USB_LOCKDOWN', 'ENABLE_BITLOCKER'):
         db.session.add(Command(device_id=device_id, command_type=cmd_type))
 
     db.session.commit()
@@ -1082,8 +1166,12 @@ def mark_found(device_id):
     if not device:
         return jsonify({'error': 'Device not found'}), 404
     device.status = 'SAFE'
+    # Reverse the USB storage lockdown so the owner can plug in their own
+    # USB drives again. BitLocker stays on (that's a healthy default).
+    db.session.add(Command(device_id=device_id, command_type='USB_UNLOCKDOWN'))
     db.session.commit()
-    return jsonify({'message': 'Device marked safe', 'status': 'SAFE'}), 200
+    return jsonify({'message': 'Device marked safe', 'status': 'SAFE',
+                    'auto_commands': ['USB_UNLOCKDOWN']}), 200
 
 # ── T2: geofence (safe zone) — owner sets it, agent reads it ──────────────────
 @app.route('/api/device/<device_id>/geofence', methods=['GET', 'POST'])
@@ -2086,6 +2174,7 @@ _ALLOWED_COMMANDS = {
     'SECURE_DATA','RESTORE_DATA',
     'DETERRENT_LOCK','UNLOCK_DETERRENT',                        # T4
     'BITLOCKER_STATUS','ENABLE_BITLOCKER','INSTANT_WIPE',       # T8
+    'USB_LOCKDOWN','USB_UNLOCKDOWN',                            # Layer A
 }
 
 @app.route('/api/command/send', methods=['POST'])

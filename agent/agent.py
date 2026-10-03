@@ -86,6 +86,21 @@ except Exception as _be0:
     _HAS_BITLOCKER = False
     print(f"BitLocker module unavailable: {_be0}")
 
+# ── USB storage lockdown + BIOS wizard model detection ────────────────────
+try:
+    import usb_lockdown
+    _HAS_USB_LOCKDOWN = True
+except Exception as _ue0:
+    _HAS_USB_LOCKDOWN = False
+    print(f"USB lockdown module unavailable: {_ue0}")
+
+try:
+    import bios_wizard
+    _HAS_BIOS_WIZARD = True
+except Exception as _bwe:
+    _HAS_BIOS_WIZARD = False
+    print(f"BIOS wizard module unavailable: {_bwe}")
+
 if getattr(sys, 'frozen', False):
     CONFIG_FILE = os.path.join(os.path.dirname(sys.executable), 'device.json')
 else:
@@ -1253,6 +1268,24 @@ if _HAS_PERSISTENCE:
 setup_shutdown_protection(DEVICE_ID)
 ensure_location(startup=True)   # ask consent once, then keep Location on
 
+# ── BIOS wizard: tell the backend what laptop model this is so the mobile
+# app can show the right instructions for setting a BIOS password.
+if _HAS_BIOS_WIZARD:
+    try:
+        mfg, mdl = bios_wizard.detect_model()
+        bios_info = bios_wizard.steps_for(mfg, mdl)
+        requests.post(f"{BASE_URL}/api/device/bios-info",
+                      json={"device_id": DEVICE_ID,
+                            "manufacturer": mfg,
+                            "model": mdl,
+                            "enter_key": bios_info['enter_key'],
+                            "fallback_key": bios_info['fallback_key'],
+                            "steps": bios_info['steps']},
+                      timeout=10)
+        print(f"[bios] reported model: {mfg} / {mdl}")
+    except Exception as _bw_err:
+        print(f"[bios] model report failed: {_bw_err}")
+
 # ── Mark the device stolen from the agent side ────────────────────────────
 # Used by factory_reset_detector when it catches the thief hitting
 # Settings → Reset this PC. Flipping status server-side triggers push
@@ -1478,6 +1511,21 @@ while True:
                 elif ctype == "INSTANT_WIPE":
                     # Irreversible. See instant_wipe() for its safety gates.
                     instant_wipe(DEVICE_ID)
+
+                elif ctype == "USB_LOCKDOWN":
+                    # Disable USB mass storage via Windows registry. Thief
+                    # can't plug in a drive to copy files out.
+                    if _HAS_USB_LOCKDOWN:
+                        usb_lockdown.lock_usb_storage()
+                    else:
+                        print("USB lockdown module unavailable")
+
+                elif ctype == "USB_UNLOCKDOWN":
+                    # Owner marked device Found — re-enable USB storage.
+                    if _HAS_USB_LOCKDOWN:
+                        usb_lockdown.unlock_usb_storage()
+                    else:
+                        print("USB lockdown module unavailable")
 
                 # Acknowledge command
                 requests.post(f"{BASE_URL}/api/command/acknowledge/{cid}", timeout=8)
