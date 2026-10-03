@@ -856,6 +856,40 @@ def delete_device(device_id):
     return jsonify({'message': f'"{device_name}" deleted'}), 200
 
 
+# ── Agent-triggered self-mark-stolen (no JWT, uses beacon_id proof) ────────
+# Called by factory_reset_detector in the agent when it catches the thief
+# in the middle of a Reset This PC. The agent is about to be wiped — we
+# can't rely on it having a cached JWT. Instead we authenticate with the
+# device's beacon_id (immutable, known only to the paired agent) + the
+# device_id. If both match a Device row, we flip status.
+@app.route('/api/device/self-mark-stolen', methods=['POST'])
+def self_mark_stolen():
+    data = request.get_json() or {}
+    device_id = data.get('device_id')
+    beacon_id = data.get('beacon_id')
+    reason    = data.get('reason', 'agent-trigger')
+    if not device_id or not beacon_id:
+        return jsonify({'error': 'Missing device_id or beacon_id'}), 400
+    device = Device.query.filter_by(id=device_id, beacon_id=beacon_id).first()
+    if not device:
+        return jsonify({'error': 'Device + beacon mismatch'}), 403
+    device.status = 'STOLEN'
+    device.stolen_at = datetime.utcnow()
+    db.session.commit()
+    # Push notify the owner — this is urgent, the thief is literally wiping.
+    try:
+        notify_device_owner(
+            device.id,
+            '⚠️ Factory-reset attempt detected',
+            f'Someone is wiping {device.device_name or "your laptop"} right now. '
+            f'Fresh evidence captured. Reason: {reason}',
+            {'device_id': str(device.id), 'kind': 'auto-stolen', 'reason': reason},
+        )
+    except Exception as e:
+        print(f"[self-stolen] notify failed: {e}")
+    return jsonify({'message': 'Device marked stolen', 'reason': reason}), 200
+
+
 @app.route('/api/device/<device_id>/mark-stolen', methods=['POST'])
 @jwt_required()
 def mark_stolen(device_id):
@@ -1378,26 +1412,37 @@ def recovery_report(device_id):
                      as_attachment=True, download_name=fname)
 
 
-def _capture_fresh_evidence(device_id, device, timeout_seconds=25):
-    """Queue PHOTO + SCREENSHOT commands and wait for new EvidencePhoto rows
-    to arrive. Returns a dict describing what actually happened — the PDF
-    builder uses it to show a status line ("fresh evidence captured just now"
-    vs "device was offline, using existing evidence").
+def _capture_fresh_evidence(device_id, device, timeout_seconds=55):
+    """Queue PHOTO + SCREENSHOT commands and wait for BOTH new EvidencePhoto
+    rows to arrive before returning.
+
+    Behaviour: keep waiting UNTIL either
+      (a) both captures have arrived in the DB (ideal),
+      (b) the device goes offline during the wait (no point waiting more),
+      (c) we hit timeout_seconds (default 55s — mobile receiveTimeout is
+          60s, so we leave 5s headroom to render + ship the PDF).
+
+    Returns a dict used by the PDF builder for its "capture status" banner.
     """
     import time as _time
+
     # Baseline: how many photos exist RIGHT NOW. We'll poll until it grows.
     baseline_count = EvidencePhoto.query.filter_by(device_id=device_id).count()
 
-    # Is the device actually online (heartbeat in last 30s)?
-    online = (device.last_seen
-              and (datetime.utcnow() - device.last_seen).total_seconds() < 30)
+    def _is_online():
+        """Re-check heartbeat freshness. We re-read Device so we see the
+        agent's latest heartbeat during the wait, not a stale snapshot."""
+        d = Device.query.filter_by(id=device_id).first()
+        if not d or not d.last_seen: return False
+        return (datetime.utcnow() - d.last_seen).total_seconds() < 30
 
-    if not online:
+    if not _is_online():
         return {'attempted': True, 'online': False,
                 'new_photos': 0,
-                'message': 'Device was offline — fresh capture skipped.'}
+                'message': 'Device was offline — fresh capture skipped. '
+                           'The report uses the latest existing images.'}
 
-    # Queue both commands. Agent polls every 3s, so first command fires in <3s.
+    # Queue both commands. Agent polls every 3s, so first command fires <3s.
     try:
         for cmd_type in ('PHOTO', 'SCREENSHOT'):
             db.session.add(Command(device_id=device_id, command_type=cmd_type))
@@ -1406,17 +1451,26 @@ def _capture_fresh_evidence(device_id, device, timeout_seconds=25):
         return {'attempted': True, 'online': True, 'new_photos': 0,
                 'message': f'Could not queue capture: {e}'}
 
-    # Poll for up to timeout_seconds. The agent needs: 3s to pick up the
-    # command + ~2s to take photo + upload to Cloudinary + save to DB.
+    # Poll until BOTH captures arrive, the device goes offline, or timeout.
+    # Faster poll cadence (1.5s) so the PDF ships the moment the second
+    # image lands — no artificial waiting past "done".
     deadline = _time.monotonic() + timeout_seconds
     last_count = baseline_count
     while _time.monotonic() < deadline:
-        _time.sleep(2)
+        _time.sleep(1.5)
         try:
             db.session.expire_all()
             last_count = EvidencePhoto.query.filter_by(device_id=device_id).count()
             if last_count >= baseline_count + 2:
-                break   # both arrived
+                break   # BOTH arrived — stop waiting
+            # If the device drops offline during the wait, there's no point
+            # staring at the clock waiting for a disconnected laptop.
+            if not _is_online():
+                return {'attempted': True, 'online': False,
+                        'new_photos': max(0, last_count - baseline_count),
+                        'message': 'Device went offline during capture. '
+                                   'The report uses whatever arrived + '
+                                   'the latest existing images.'}
         except Exception:
             pass
 
@@ -1424,9 +1478,12 @@ def _capture_fresh_evidence(device_id, device, timeout_seconds=25):
     if new_photos >= 2:
         msg = 'Fresh webcam shot and screenshot captured just now.'
     elif new_photos == 1:
-        msg = 'One fresh capture arrived; the other is still pending.'
+        msg = ('One fresh capture arrived in time; the other is still '
+               'uploading and will appear in the next report.')
     else:
-        msg = 'Capture commands were queued but no new evidence arrived in time.'
+        msg = ('Capture commands were sent but no new evidence arrived '
+               'in time (the device may be slow or the thief may have '
+               'disabled the camera). The report uses the latest existing images.')
     return {'attempted': True, 'online': True,
             'new_photos': new_photos, 'message': msg}
 

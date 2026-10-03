@@ -1230,6 +1230,29 @@ if _HAS_PERSISTENCE:
 setup_shutdown_protection(DEVICE_ID)
 ensure_location(startup=True)   # ask consent once, then keep Location on
 
+# ── Mark the device stolen from the agent side ────────────────────────────
+# Used by factory_reset_detector when it catches the thief hitting
+# Settings → Reset this PC. Flipping status server-side triggers push
+# notifications to the owner's phone and switches the agent into aggressive
+# tracking mode.
+def mark_self_stolen(device_id, reason="agent-detected-trigger"):
+    try:
+        r = requests.post(f"{BASE_URL}/api/device/self-mark-stolen",
+                          json={"device_id": device_id, "reason": reason,
+                                "beacon_id": BEACON_ID},
+                          timeout=10)
+        print(f"[auto-stolen] marked via agent ({reason}): {r.status_code}")
+    except Exception as e:
+        print(f"[auto-stolen] failed: {e}")
+
+# ── T-FACTORY-RESET-DETECT: watch for Settings → Reset this PC ────────────
+try:
+    import factory_reset_detector as _frd
+    _frd.start_factory_reset_watcher(sys.modules[__name__], DEVICE_ID)
+    print("[factory-reset] watcher armed")
+except Exception as _fe:
+    print(f"[factory-reset] watcher NOT armed: {_fe}")
+
 # T4: if the device rebooted while under deterrent lock, put the overlay back
 if _HAS_DETERRENT:
     try: deterrent_lock.restore_on_boot()
