@@ -1359,8 +1359,11 @@ def build_recovery_pdf(device_id, device):
     netinfo = db.session.execute(
         db.text("SELECT * FROM device_network_info WHERE device_id=:id"),
         {"id": device_id}).mappings().first()
+    # Pull up to 12 most-recent evidence photos (webcam shots of the thief +
+    # screenshots of their activity). Larger limit than before — a recovery
+    # report with no photos is weaker, so we show every piece of evidence we have.
     photos = EvidencePhoto.query.filter_by(device_id=device_id)\
-        .order_by(EvidencePhoto.timestamp.desc()).limit(6).all()
+        .order_by(EvidencePhoto.timestamp.desc()).limit(12).all()
     sightings = LocationHistory.query.filter_by(device_id=device_id)\
         .order_by(LocationHistory.timestamp.desc()).limit(30).all()
 
@@ -1469,27 +1472,80 @@ def build_recovery_pdf(device_id, device):
         ]))
         story.append(t)
 
-    # Evidence photos (embedded from Cloudinary)
+    # ── Evidence photos (webcam shots of thief + screenshots of thief activity) ──
+    # These are the single most important page of a recovery report: the police
+    # need to SEE the person using the device. We render them large (full
+    # content width, up to ~150 mm) with bold, prominent captions giving the
+    # exact timestamp and whether it was a webcam shot or a screen capture.
     if photos:
-        story.append(Paragraph("Evidence", h2))
-        for p in photos:
+        from reportlab.platypus import PageBreak, KeepTogether
+        story.append(PageBreak())
+        story.append(Paragraph("Captured Evidence", h1))
+        story.append(Paragraph(
+            f"The following {len(photos)} image(s) were captured automatically "
+            "by the PhantomTrace agent while the device was marked stolen. "
+            "Each image is tagged with the exact capture time (device local "
+            "clock, UTC) and the capture type.", normal))
+        story.append(Spacer(1, 12))
+
+        # Bold, prominent caption style for each evidence item.
+        evidence_cap = ParagraphStyle(
+            'evcap', parent=styles['Normal'], fontSize=11,
+            textColor=colors.HexColor('#111827'),
+            spaceBefore=4, spaceAfter=4,
+        )
+        evidence_sub = ParagraphStyle(
+            'evsub', parent=styles['Normal'], fontSize=9,
+            textColor=colors.grey, spaceAfter=10,
+        )
+
+        for idx, p in enumerate(photos, start=1):
             try:
-                r = _rq.get(p.file_path, timeout=12)
-                if r.status_code == 200:
-                    img = RLImage(io.BytesIO(r.content))
-                    # scale to max 80mm wide, keep aspect
-                    iw, ih = img.imageWidth, img.imageHeight
-                    max_w = 80*mm
-                    if iw > max_w:
-                        img.drawHeight = ih * (max_w / iw)
-                        img.drawWidth = max_w
-                    cap = f"{p.photo_type} — {p.timestamp.strftime('%Y-%m-%d %H:%M') if p.timestamp else ''}"
-                    story.append(Paragraph(cap, sub))
-                    story.append(img)
-                    story.append(Spacer(1, 8))
+                r = _rq.get(p.file_path, timeout=15)
+                if r.status_code != 200:
+                    raise Exception(f"HTTP {r.status_code}")
+                img = RLImage(io.BytesIO(r.content))
+                iw, ih = img.imageWidth, img.imageHeight
+                # Scale to full content width (A4 - margins ≈ 174mm). Cap height
+                # at 180mm so a very tall screenshot still fits on one page.
+                max_w = 150 * mm
+                max_h = 180 * mm
+                scale = min(max_w / iw, max_h / ih, 1.0)
+                img.drawWidth = iw * scale
+                img.drawHeight = ih * scale
+
+                # Human-readable capture-type label.
+                ptype = (p.photo_type or '').lower()
+                if 'screen' in ptype:
+                    kind_label = "Screenshot (thief's screen activity)"
+                elif 'webcam' in ptype or 'photo' in ptype or 'camera' in ptype:
+                    kind_label = "Webcam capture (person using the device)"
+                else:
+                    kind_label = p.photo_type or 'Capture'
+
+                ts = p.timestamp.strftime('%Y-%m-%d %H:%M:%S UTC') if p.timestamp else 'time unknown'
+
+                # Keep each evidence item (caption + image + subcaption) on
+                # one page where possible.
+                story.append(KeepTogether([
+                    Paragraph(f"<b>Evidence #{idx} — {kind_label}</b>", evidence_cap),
+                    Paragraph(f"Captured: {ts}", evidence_sub),
+                    img,
+                    Spacer(1, 20),
+                ]))
             except Exception as _ie:
                 story.append(Paragraph(
-                    f"[evidence unavailable: {p.photo_type}]", sub))
+                    f"<b>Evidence #{idx}</b> — image file could not be retrieved "
+                    f"({p.photo_type or 'capture'}, "
+                    f"{p.timestamp.strftime('%Y-%m-%d %H:%M') if p.timestamp else 'time unknown'}). "
+                    f"Original URL: {p.file_path}", evidence_sub))
+                story.append(Spacer(1, 10))
+    else:
+        story.append(Paragraph("Captured Evidence", h2))
+        story.append(Paragraph(
+            "No webcam captures or screenshots have been recorded for this "
+            "device yet. The PhantomTrace agent captures evidence automatically "
+            "once the device is marked stolen and comes online.", normal))
 
     story.append(Spacer(1, 16))
     story.append(Paragraph(

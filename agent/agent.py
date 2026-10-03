@@ -750,54 +750,140 @@ def lock_device():
     except Exception as e:
         print(f"Lock failed: {e}")
 
+# ── Alarm: force-max-volume + synthesized irritating two-tone siren ───────────
+#
+# The old alarm used console beeps that were quiet, polite, and completely
+# useless when the thief had already turned the volume down. This rewrite:
+#   1. Forces the Windows master volume to 100% and unmutes BEFORE playing,
+#      using pycaw (hardware mixer access, same thing the volume slider uses).
+#   2. Synthesizes a loud two-tone siren WAV directly (no ffmpeg needed, no
+#      external files). Frequency swings between ~700 Hz and ~1400 Hz every
+#      0.4s to produce the deliberately irritating "police siren" feel.
+#   3. Plays it with winsound in LOOP mode so it never stops until the owner
+#      sends STOP_ALARM or the device is unlocked.
+#   4. Re-asserts max volume every 2 seconds — if the thief frantically grabs
+#      the volume slider, it snaps back up within 2s.
+def _force_max_volume_windows():
+    """Set master volume to 100% and unmute. Hardware level, bypasses UI."""
+    try:
+        from ctypes import cast, POINTER
+        from comtypes import CLSCTX_ALL
+        from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+        devices = AudioUtilities.GetSpeakers()
+        interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+        volume = cast(interface, POINTER(IAudioEndpointVolume))
+        volume.SetMute(0, None)
+        volume.SetMasterVolumeLevelScalar(1.0, None)
+    except Exception as e:
+        print(f"Volume force failed: {e}")
+
+def _synthesize_siren_wav(path, duration_seconds=6):
+    """Write a looping two-tone siren WAV to `path`. 22.05 kHz, 16-bit mono.
+    Sweeps between ~700 Hz and ~1400 Hz every 0.4s. Harmonically layered so it
+    sounds grating and attention-grabbing, not musical."""
+    import wave, math, struct
+    rate = 22050
+    n = int(rate * duration_seconds)
+    amp = 32000  # near-max 16-bit
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        frames = bytearray()
+        for i in range(n):
+            t = i / rate
+            # Sweep 700 Hz <-> 1400 Hz on 0.4s period
+            phase = (t % 0.4) / 0.4
+            freq = 700 + 700 * phase if int(t / 0.4) % 2 == 0 else 1400 - 700 * phase
+            # Fundamental + 2nd harmonic for the grating "siren" feel
+            s = math.sin(2 * math.pi * freq * t) * 0.7
+            s += math.sin(2 * math.pi * freq * 2 * t) * 0.3
+            val = int(s * amp)
+            if val > 32767: val = 32767
+            if val < -32768: val = -32768
+            frames.extend(struct.pack("<h", val))
+        w.writeframes(bytes(frames))
+
 def trigger_alarm(device_id):
     global _alarm_active
     _alarm_active = True
-    def _alarm():
+
+    def _alarm_windows():
         try:
-            if IS_WINDOWS:
-                # Windows: generate and play alarm using PowerShell
-                ps_script = r"""
-[console]::beep(1000, 500)
-$player = New-Object System.Media.SoundPlayer
-for ($i=0; $i -lt 30; $i++) { [console]::beep(1000+($i*50), 200) }
-"""
-                for _ in range(5):
-                    if not _alarm_active: break
-                    subprocess.run(["powershell","-Command", ps_script], capture_output=True, timeout=10, creationflags=NO_WINDOW)
-            else:
-                # Linux: use ffmpeg to generate a siren wav then play it
-                alarm_file = "/tmp/pt_alarm.wav"
-                subprocess.run([
-                    "ffmpeg","-y","-f","lavfi",
-                    "-i","sine=frequency=1000:duration=30", alarm_file
-                ], capture_output=True, check=False)
-                current_user = getpass.getuser()
-                env = os.environ.copy()
-                env['DISPLAY'] = ':0'
-                # Raise volume
-                subprocess.run(["amixer","sset","Master","100%","unmute"],
-                    capture_output=True, check=False)
-                for _ in range(5):
-                    if not _alarm_active: break
-                    subprocess.run(["ffplay","-nodisp","-autoexit","-volume","100", alarm_file],
-                        env=env, capture_output=True, check=False)
+            import winsound
+            siren_path = os.path.join(os.environ.get("TEMP", "C:\\Windows\\Temp"),
+                                      "pt_siren.wav")
+            # (Re-)synthesize each time the alarm fires so a thief who deleted
+            # the previous WAV from TEMP can't disable the alarm.
+            try:
+                _synthesize_siren_wav(siren_path, duration_seconds=6)
+            except Exception as e:
+                print(f"Siren synth failed, falling back to beeps: {e}")
+                while _alarm_active:
+                    winsound.Beep(1000, 500)
+                    winsound.Beep(1400, 500)
+                return
+
+            # Force volume BEFORE playing so the first second is already loud.
+            _force_max_volume_windows()
+            # SND_LOOP + SND_ASYNC = plays in background, loops forever until
+            # we call PlaySound(None, SND_PURGE) in stop_alarm().
+            winsound.PlaySound(siren_path,
+                               winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_LOOP)
+
+            # Re-assert volume every 2s in case the thief tries to mute.
+            while _alarm_active:
+                time.sleep(2)
+                _force_max_volume_windows()
         except Exception as e:
-            print(f"Alarm error: {e}")
-    threading.Thread(target=_alarm, daemon=True).start()
+            print(f"Alarm (win) error: {e}")
+
+    def _alarm_linux():
+        try:
+            alarm_file = "/tmp/pt_alarm.wav"
+            try:
+                _synthesize_siren_wav(alarm_file, duration_seconds=6)
+            except Exception:
+                subprocess.run([
+                    "ffmpeg", "-y", "-f", "lavfi",
+                    "-i", "sine=frequency=1000:duration=6", alarm_file
+                ], capture_output=True, check=False)
+            env = os.environ.copy()
+            env['DISPLAY'] = ':0'
+            subprocess.run(["amixer", "sset", "Master", "100%", "unmute"],
+                           capture_output=True, check=False)
+            while _alarm_active:
+                subprocess.run(["ffplay", "-nodisp", "-autoexit", "-volume", "100",
+                                alarm_file], env=env, capture_output=True, check=False)
+        except Exception as e:
+            print(f"Alarm (linux) error: {e}")
+
+    threading.Thread(
+        target=_alarm_windows if IS_WINDOWS else _alarm_linux,
+        daemon=True
+    ).start()
     lock_device()
-    print("ALARM TRIGGERED")
+    print("ALARM TRIGGERED (max volume, looping siren)")
 
 def stop_alarm():
     global _alarm_active
     _alarm_active = False
     if IS_WINDOWS:
-        subprocess.run(["taskkill", "/F", "/IM", "ffplay.exe"],  check=False, capture_output=True, creationflags=NO_WINDOW)
-        subprocess.run(["taskkill", "/F", "/IM", "ffplay_g.exe"],check=False, capture_output=True, creationflags=NO_WINDOW)
+        try:
+            import winsound
+            # Purge the looping siren immediately.
+            winsound.PlaySound(None, winsound.SND_PURGE)
+        except Exception as e:
+            print(f"winsound purge failed: {e}")
+        # Belt-and-braces: kill any lingering ffplay from older alarm paths.
+        subprocess.run(["taskkill", "/F", "/IM", "ffplay.exe"],
+                       check=False, capture_output=True, creationflags=NO_WINDOW)
+        subprocess.run(["taskkill", "/F", "/IM", "ffplay_g.exe"],
+                       check=False, capture_output=True, creationflags=NO_WINDOW)
     else:
-        subprocess.run(["pkill","-f","ffplay"], check=False)
-        subprocess.run(["pkill","-f","aplay"],  check=False)
-        subprocess.run(["pkill","-f","paplay"], check=False)
+        subprocess.run(["pkill", "-f", "ffplay"], check=False)
+        subprocess.run(["pkill", "-f", "aplay"],  check=False)
+        subprocess.run(["pkill", "-f", "paplay"], check=False)
     print("ALARM STOPPED")
 
 def take_photo():
