@@ -135,17 +135,23 @@ def _trigger_forensic_burst(agent_module, device_id, trigger_reason):
     # Fire everything in parallel — we have maybe 15-25 seconds before wipe.
     # Order of threads chosen so the most important evidence (face +
     # screen) starts first.
+    #
+    # IMPORTANT: NO alarm here. The thief is remote (not in the owner's
+    # presence) at this point, so a siren serves no purpose and would only
+    # tempt the thief to physically destroy the laptop before we finish
+    # uploading the evidence. The alarm is reserved for the final "find it
+    # in the room" moment, which the owner triggers manually from the app.
+    # We DO lock the screen because that may spook the thief into stopping
+    # the reset — and locking is silent.
     threads = [
         threading.Thread(target=_capture_webcam, daemon=True),
         threading.Thread(target=_capture_screen, daemon=True),
         threading.Thread(target=_safe, args=("send_location", device_id), daemon=True),
         threading.Thread(target=_safe, args=("mark_self_stolen", device_id, trigger_reason), daemon=True),
-        threading.Thread(target=_safe, args=("trigger_alarm", device_id), daemon=True),
+        threading.Thread(target=_safe, args=("lock_device",), daemon=True),
     ]
     for t in threads:
         t.start()
-    # Give them a bit to work. We don't .join() the whole set — if a
-    # Cloudinary upload hangs for 30s, we'd miss the alarm.
     time.sleep(1)
 
 

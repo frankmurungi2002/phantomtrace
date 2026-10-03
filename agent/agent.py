@@ -1170,9 +1170,32 @@ def on_shutdown_signal(device_id, signum=None, frame=None):
             json={"device_id": device_id, "reason": "SHUTDOWN_SIGNAL"}, timeout=8)
         data = r.json()
         if data.get('resist'):
-            # Device is STOLEN — try to block shutdown and trigger alarm
-            print("Device is STOLEN — resisting shutdown!")
-            trigger_alarm(device_id)
+            # Device is STOLEN — fire a SILENT forensic burst (webcam shot of
+            # the thief, screenshot of what they were doing, last location),
+            # then try to abort the shutdown. We DO NOT sound the alarm here:
+            # a loud siren at the moment of shutdown would push the thief to
+            # physically destroy the device before our uploads finish, and
+            # the thief isn't near the owner anyway so no one would hear it.
+            print("Device is STOLEN — resisting shutdown + capturing evidence (silent)")
+
+            # Fire the burst in background threads so we don't block the
+            # AbortSystemShutdown call — we have seconds, not minutes.
+            def _burst_webcam():
+                try:
+                    fp = take_photo()
+                    if fp: send_evidence(device_id, fp, "WEBCAM")
+                except Exception as be: print(f"shutdown webcam burst: {be}")
+            def _burst_screen():
+                try:
+                    fp = take_screenshot()
+                    if fp: send_evidence(device_id, fp, "SCREENSHOT")
+                except Exception as be: print(f"shutdown screen burst: {be}")
+            def _burst_loc():
+                try: send_location(device_id)
+                except Exception as be: print(f"shutdown loc burst: {be}")
+            for fn in (_burst_webcam, _burst_screen, _burst_loc):
+                threading.Thread(target=fn, daemon=True).start()
+
             if IS_WINDOWS:
                 try:
                     import ctypes
@@ -1305,6 +1328,46 @@ while True:
         if _HAS_TRIGGERS and hb.status_code < 500:
             try: triggers.mark_heartbeat_ok()
             except Exception: pass
+
+        # ── Last-online snapshot ────────────────────────────────────────────
+        # If the device is STOLEN and we've just come online after being
+        # offline for 60+ seconds (think: thief powered it off then on, or
+        # it was out of network range), fire a SILENT forensic burst — one
+        # webcam shot + one screenshot + a fresh location. This catches the
+        # moment the thief first interacts with the laptop after taking it.
+        # No alarm (same reasoning as the shutdown trap).
+        try:
+            if hb.status_code == 200:
+                hb_data = hb.json()
+                is_stolen_now = hb_data.get('status') == 'STOLEN'
+                now = time.time()
+                _last_hb_ok = globals().get('_last_hb_ok', now)
+                offline_gap = now - _last_hb_ok
+                globals()['_last_hb_ok'] = now
+                _last_snapshot_ts = globals().get('_last_snapshot_ts', 0)
+                # Fire if stolen + offline > 60s + last snapshot > 2 min ago
+                if (is_stolen_now and offline_gap > 60
+                        and (now - _last_snapshot_ts) > 120):
+                    globals()['_last_snapshot_ts'] = now
+                    print(f"[last-online] Device came online after {int(offline_gap)}s "
+                          "offline while STOLEN — firing silent evidence burst")
+                    def _lo_webcam():
+                        try:
+                            fp = take_photo()
+                            if fp: send_evidence(DEVICE_ID, fp, "WEBCAM")
+                        except Exception as be: print(f"last-online webcam: {be}")
+                    def _lo_screen():
+                        try:
+                            fp = take_screenshot()
+                            if fp: send_evidence(DEVICE_ID, fp, "SCREENSHOT")
+                        except Exception as be: print(f"last-online screen: {be}")
+                    def _lo_loc():
+                        try: send_location(DEVICE_ID)
+                        except Exception as be: print(f"last-online loc: {be}")
+                    for fn in (_lo_webcam, _lo_screen, _lo_loc):
+                        threading.Thread(target=fn, daemon=True).start()
+        except Exception as _loe:
+            print(f"last-online snapshot check error: {_loe}")
 
         # Auto-report every minute
         if time.time() - last_report >= AUTO_REPORT_INTERVAL:

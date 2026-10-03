@@ -205,6 +205,21 @@ class Command(db.Model):
     issued_at = db.Column(db.DateTime, default=datetime.utcnow)
     executed_at = db.Column(db.DateTime)
 
+class EmergencyContact(db.Model):
+    """People to notify in addition to the owner when a device is marked stolen.
+    Think: spouse, flatmate, campus security, driver. On mark-stolen the
+    backend emails each contact (and SMSes if phone is set) with the recovery
+    report attached."""
+    __tablename__ = 'emergency_contacts'
+    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = db.Column(db.String(36), db.ForeignKey('users.id'), nullable=False)
+    name = db.Column(db.String(120), nullable=False)
+    email = db.Column(db.String(120))
+    phone = db.Column(db.String(30))
+    relationship = db.Column(db.String(60))   # 'spouse', 'security', 'flatmate', etc.
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+
 class EvidencePhoto(db.Model):
     __tablename__ = 'evidence_photos'
     id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
@@ -856,6 +871,144 @@ def delete_device(device_id):
     return jsonify({'message': f'"{device_name}" deleted'}), 200
 
 
+# ── Emergency contacts: CRUD endpoints ────────────────────────────────────
+@app.route('/api/user/emergency-contacts', methods=['GET'])
+@jwt_required()
+def list_emergency_contacts():
+    uid = get_jwt_identity()
+    contacts = EmergencyContact.query.filter_by(user_id=uid)\
+        .order_by(EmergencyContact.created_at.asc()).all()
+    return jsonify({'contacts': [
+        {'id': c.id, 'name': c.name, 'email': c.email, 'phone': c.phone,
+         'relationship': c.relationship} for c in contacts
+    ]}), 200
+
+
+@app.route('/api/user/emergency-contacts', methods=['POST'])
+@jwt_required()
+def add_emergency_contact():
+    uid = get_jwt_identity()
+    data = request.get_json() or {}
+    name = (data.get('name') or '').strip()
+    if not name:
+        return jsonify({'error': 'name is required'}), 400
+    email = (data.get('email') or '').strip() or None
+    phone = (data.get('phone') or '').strip() or None
+    if not email and not phone:
+        return jsonify({'error': 'email or phone must be provided'}), 400
+    c = EmergencyContact(
+        user_id=uid, name=name, email=email, phone=phone,
+        relationship=(data.get('relationship') or '').strip() or None,
+    )
+    db.session.add(c)
+    db.session.commit()
+    return jsonify({'id': c.id, 'message': 'Emergency contact added'}), 201
+
+
+@app.route('/api/user/emergency-contacts/<contact_id>', methods=['DELETE'])
+@jwt_required()
+def delete_emergency_contact(contact_id):
+    uid = get_jwt_identity()
+    c = EmergencyContact.query.filter_by(id=contact_id, user_id=uid).first()
+    if not c:
+        return jsonify({'error': 'Not found'}), 404
+    db.session.delete(c)
+    db.session.commit()
+    return jsonify({'message': 'Emergency contact removed'}), 200
+
+
+# ── Email sender: used to deliver recovery PDF on mark-stolen ──────────────
+# Reads SMTP settings from env vars; silently no-ops if any are missing so
+# the backend keeps working for dev without SMTP configured.
+#   SMTP_HOST, SMTP_PORT (default 587), SMTP_USER, SMTP_PASS, SMTP_FROM
+# For Gmail use smtp.gmail.com port 587 with an App Password (not your
+# regular Gmail password — 2FA must be on).
+def send_email_with_pdf(to_addrs, subject, body_text, pdf_bytes, pdf_filename,
+                        reply_to=None):
+    host = os.getenv('SMTP_HOST')
+    user = os.getenv('SMTP_USER')
+    pw   = os.getenv('SMTP_PASS')
+    sender = os.getenv('SMTP_FROM') or user
+    port = int(os.getenv('SMTP_PORT', '587'))
+    if not (host and user and pw and sender):
+        print("[email] SMTP not configured — skipping")
+        return False
+    if isinstance(to_addrs, str):
+        to_addrs = [to_addrs]
+    to_addrs = [a for a in to_addrs if a and '@' in a]
+    if not to_addrs:
+        print("[email] no valid recipients")
+        return False
+    try:
+        import smtplib
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.text import MIMEText
+        from email.mime.application import MIMEApplication
+        msg = MIMEMultipart()
+        msg['From'] = f'PhantomTrace <{sender}>'
+        msg['To']   = ', '.join(to_addrs)
+        msg['Subject'] = subject
+        if reply_to:
+            msg['Reply-To'] = reply_to
+        msg.attach(MIMEText(body_text, 'plain'))
+        if pdf_bytes:
+            part = MIMEApplication(pdf_bytes, _subtype='pdf')
+            part.add_header('Content-Disposition', 'attachment',
+                            filename=pdf_filename)
+            msg.attach(part)
+        with smtplib.SMTP(host, port, timeout=20) as s:
+            s.starttls()
+            s.login(user, pw)
+            s.sendmail(sender, to_addrs, msg.as_string())
+        print(f"[email] sent to {to_addrs} subj={subject!r}")
+        return True
+    except Exception as e:
+        print(f"[email] send failed: {e}")
+        return False
+
+
+def dispatch_stolen_notifications(device):
+    """When a device is marked stolen, build the recovery PDF and deliver
+    it by email to the owner + all their emergency contacts, in a
+    background thread so the HTTP response returns immediately."""
+    def _work():
+        try:
+            owner = User.query.filter_by(id=device.user_id).first()
+            if not owner:
+                return
+            pdf_buf = build_recovery_pdf(device.id, device)
+            pdf_bytes = pdf_buf.read()
+            pdf_name = f"PhantomTrace_Report_{(device.device_name or 'device').replace(' ', '_')}.pdf"
+
+            recipients = []
+            if owner.email: recipients.append(owner.email)
+            contacts = EmergencyContact.query.filter_by(user_id=owner.id).all()
+            for c in contacts:
+                if c.email: recipients.append(c.email)
+            if not recipients:
+                print(f"[stolen-notify] device {device.id}: no email recipients configured")
+                return
+
+            subject = f"⚠️ {device.device_name or 'Your laptop'} marked STOLEN — PhantomTrace recovery report"
+            body = (
+                f"Hello,\n\n"
+                f"{owner.name or 'The owner'} has marked the device '{device.device_name}' as STOLEN "
+                f"on PhantomTrace. The initial recovery report is attached — it includes the last "
+                f"known location, system fingerprint, and the latest captured evidence.\n\n"
+                f"If you are not {owner.name or 'the owner'}, you were listed as an emergency contact. "
+                f"Please get in touch with them immediately and share this report with the "
+                f"authorities as needed.\n\n"
+                f"— PhantomTrace\n"
+            )
+            send_email_with_pdf(recipients, subject, body, pdf_bytes, pdf_name,
+                                reply_to=owner.email)
+        except Exception as e:
+            print(f"[stolen-notify] background job failed: {e}")
+
+    import threading as _th
+    _th.Thread(target=_work, daemon=True).start()
+
+
 # ── Agent-triggered self-mark-stolen (no JWT, uses beacon_id proof) ────────
 # Called by factory_reset_detector in the agent when it catches the thief
 # in the middle of a Reset This PC. The agent is about to be wiped — we
@@ -887,6 +1040,8 @@ def self_mark_stolen():
         )
     except Exception as e:
         print(f"[self-stolen] notify failed: {e}")
+    # Also email the recovery PDF to the owner + emergency contacts.
+    dispatch_stolen_notifications(device)
     return jsonify({'message': 'Device marked stolen', 'reason': reason}), 200
 
 
@@ -905,10 +1060,18 @@ def mark_stolen(device_id):
 
     # Auto-queue the forensic burst. Even if the device is offline right now,
     # these commands sit in the queue and fire the moment it comes back online.
-    for cmd_type in ('PHOTO', 'SCREENSHOT', 'LOCK'):
+    # ENABLE_BITLOCKER enforces full-disk encryption so the thief can't boot
+    # the laptop from USB and read the SSD contents — once BitLocker is on,
+    # that drive is a brick without the recovery key (which we escrow in the DB).
+    for cmd_type in ('PHOTO', 'SCREENSHOT', 'LOCK', 'ENABLE_BITLOCKER'):
         db.session.add(Command(device_id=device_id, command_type=cmd_type))
 
     db.session.commit()
+
+    # Background: email the recovery PDF to the owner and all their
+    # emergency contacts. Fire-and-forget so the mobile request returns fast.
+    dispatch_stolen_notifications(device)
+
     return jsonify({'message': 'Device marked stolen', 'status': 'STOLEN',
                     'auto_commands': ['PHOTO', 'SCREENSHOT', 'LOCK']}), 200
 
@@ -1833,7 +1996,14 @@ def heartbeat():
     db.session.commit()
     if was_offline:
         notify_device_owner(device.id, '🟢 Device Online', f'{device.device_name} is now online', {'device_id': device.id})
-    return jsonify({'message': 'Heartbeat received', 'timestamp': device.last_seen.isoformat()}), 200
+    # Return status + stolen_at so the agent can decide to fire a last-online
+    # evidence burst (handled in the agent's main loop).
+    return jsonify({
+        'message': 'Heartbeat received',
+        'timestamp': device.last_seen.isoformat(),
+        'status': device.status,
+        'stolen_at': device.stolen_at.isoformat() if device.stolen_at else None,
+    }), 200
 
 @app.route('/api/device/systeminfo', methods=['POST'])
 def device_systeminfo():
