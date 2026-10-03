@@ -365,11 +365,45 @@ def get_or_register_device():
                 config = json.load(f)
             dev_id = (config or {}).get('device_id', '').strip()
             if dev_id:
-                print(f"Device ID: {dev_id}")
-                return dev_id, config.get('beacon_id', '')
-            print("device.json exists but has no device_id — reprompting for pairing.")
-            try: os.remove(CONFIG_FILE)
-            except Exception: pass
+                # NEW: validate with the backend. The owner may have deleted
+                # this device from the mobile app (or wiped the DB), in which
+                # case our stored device_id is a ghost and heartbeats will
+                # fall into a black hole. Ask the backend before trusting it.
+                try:
+                    r = requests.get(
+                        f"{BASE_URL}/api/device/{dev_id}/exists",
+                        timeout=10)
+                    if r.status_code == 200 and r.json().get('exists') is True:
+                        print(f"Device ID: {dev_id} (verified with backend)")
+                        return dev_id, config.get('beacon_id', '')
+                    # Backend answered but doesn't know this device — clear
+                    # local state and re-prompt. ALSO clean up the registry
+                    # backup so persistence.restore_device_config can't bring
+                    # the stale ID back on the next launch.
+                    print(f"Backend does not recognise device {dev_id} — "
+                          "clearing local state and re-prompting for pairing.")
+                    try: os.remove(CONFIG_FILE)
+                    except Exception: pass
+                    try:
+                        subprocess.run(
+                            ["reg", "delete",
+                             r"HKCU\Software\PhantomTrace", "/f"],
+                            capture_output=True,
+                            creationflags=NO_WINDOW if IS_WINDOWS else 0,
+                        )
+                    except Exception: pass
+                except Exception as _ve:
+                    # Backend unreachable — give the stored ID the benefit of
+                    # the doubt (offline-first). We retry at every launch, so
+                    # the next online launch will resolve it.
+                    print(f"Could not verify device_id with backend "
+                          f"({_ve}) — assuming valid for now.")
+                    print(f"Device ID: {dev_id}")
+                    return dev_id, config.get('beacon_id', '')
+            else:
+                print("device.json exists but has no device_id — reprompting for pairing.")
+                try: os.remove(CONFIG_FILE)
+                except Exception: pass
         except Exception as e:
             print(f"device.json unreadable ({e}) — reprompting for pairing.")
             try: os.remove(CONFIG_FILE)

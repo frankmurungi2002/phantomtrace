@@ -2311,6 +2311,24 @@ def sightings_list(device_id):
         'timestamp': r.timestamp.isoformat() if r.timestamp else '',
     } for r in rows]}), 200
 
+# Agent calls this at startup with the device_id it has stored locally.
+# If the backend doesn't know that device (owner deleted it, DB rotated,
+# testing with a different environment), the agent clears local state and
+# re-prompts for a pairing code — closes the "agent silently runs with a
+# ghost ID" bug. Public: no JWT. The device_id itself is the proof, and
+# we return only a yes/no answer so there's nothing meaningful to leak.
+@app.route('/api/device/<device_id>/exists', methods=['GET'])
+def device_exists(device_id):
+    d = Device.query.filter_by(id=device_id).first()
+    if not d:
+        return jsonify({'exists': False}), 200
+    return jsonify({
+        'exists': True,
+        'device_name': d.device_name,
+        'status': d.status,
+    }), 200
+
+
 @app.route('/api/device/heartbeat', methods=['POST'])
 def heartbeat():
     data = request.get_json()
