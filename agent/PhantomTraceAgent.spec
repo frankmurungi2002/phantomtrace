@@ -16,6 +16,7 @@ hiddenimports += [
     'factory_reset_detector',   # T-FACTORY-RESET-DETECT
     'usb_lockdown',              # Layer A — USB mass storage lockdown
     'bios_wizard',               # Layer C — BIOS password setup wizard
+    'self_destruct',             # v1 — AGENT_UNINSTALL self-destruct
     'win32api', 'win32con', 'win32timezone', 'pywintypes', 'pythoncom',
     'requests', 'PIL', 'numpy',
     'tkinter', 'tkinter.ttk',   # T4 overlay

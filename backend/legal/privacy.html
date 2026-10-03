@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Privacy Policy — PhantomTrace</title>
+<style>
+  :root {
+    --bg:        #0A0A0A;
+    --surface:   #141A2E;
+    --text:      #F3F4F6;
+    --muted:     #9CA3AF;
+    --primary:   #DC2626;
+    --divider:   #1F2937;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    line-height: 1.65;
+    font-size: 16px;
+  }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 48px 24px 96px; }
+  .brand { display: flex; align-items: center; gap: 10px; margin-bottom: 32px; }
+  .brand .diamond { color: var(--primary); font-size: 22px; }
+  .brand .name   { font-weight: 800; letter-spacing: 1.2px; font-size: 14px; }
+  h1 { font-size: 32px; font-weight: 800; margin: 0 0 6px; }
+  .updated { color: var(--muted); font-size: 13px; margin-bottom: 40px; }
+  h2 { font-size: 20px; margin-top: 44px; margin-bottom: 12px; color: var(--primary); }
+  h3 { font-size: 16px; margin-top: 22px; margin-bottom: 6px; color: #E5E7EB; }
+  p  { margin: 0 0 14px; color: #D1D5DB; }
+  ul { padding-left: 20px; color: #D1D5DB; }
+  li { margin-bottom: 6px; }
+  a  { color: var(--primary); }
+  table { width: 100%; border-collapse: collapse; margin: 10px 0 20px;
+          font-size: 14px; background: var(--surface); border-radius: 10px;
+          overflow: hidden; }
+  th, td { padding: 10px 12px; text-align: left; vertical-align: top;
+           border-bottom: 1px solid var(--divider); }
+  th { background: #1E2639; color: #E5E7EB; font-weight: 700;
+       font-size: 13px; letter-spacing: 1px; text-transform: uppercase; }
+  .divider { height: 1px; background: var(--divider); margin: 56px 0 24px; }
+  .footer { color: var(--muted); font-size: 13px; }
+  .callout {
+    border-left: 3px solid var(--primary);
+    background: rgba(220,38,38,0.07);
+    padding: 14px 18px; margin: 18px 0; border-radius: 4px;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="brand"><span class="diamond">◆</span><span class="name">PHANTOMTRACE</span></div>
+  <h1>Privacy Policy</h1>
+  <p class="updated">Last updated: 3 October 2026</p>
+
+  <p>This Privacy Policy explains what personal data PhantomTrace collects,
+  why we collect it, how we store it, and the rights you have over it. We
+  wrote it in plain language. If anything is still unclear, email
+  <a href="mailto:mywatchhhh@gmail.com">mywatchhhh@gmail.com</a>.</p>
+
+  <h2>1. Who we are</h2>
+  <p>PhantomTrace is operated by Francis Murungi, Software Engineering,
+  Mbarara University of Science and Technology, Uganda. For privacy
+  questions, including data access and deletion requests, write to
+  <a href="mailto:mywatchhhh@gmail.com">mywatchhhh@gmail.com</a>.</p>
+
+  <h2>2. What we collect, and why</h2>
+  <table>
+    <tr>
+      <th>Category</th>
+      <th>Examples</th>
+      <th>Why we need it</th>
+    </tr>
+    <tr>
+      <td><b>Account</b></td>
+      <td>Full name, email, phone number, hashed password, two-factor code
+          seed (if enabled)</td>
+      <td>To create and secure your account.</td>
+    </tr>
+    <tr>
+      <td><b>Devices</b></td>
+      <td>Laptop hostname, operating system version, MAC and IP addresses,
+          CPU model, disk sizes, running process list, laptop manufacturer
+          and model (for BIOS instructions)</td>
+      <td>To identify your device, show it in your dashboard, and prove
+          ownership in a recovery report.</td>
+    </tr>
+    <tr>
+      <td><b>Location</b></td>
+      <td>Latitude, longitude, Wi-Fi access points seen nearby, inferred
+          city and country</td>
+      <td>To help you locate the device if it is missing.</td>
+    </tr>
+    <tr>
+      <td><b>Evidence</b></td>
+      <td>Webcam photos and screenshots captured ONLY when you (the owner)
+          send the corresponding command, or when the device is marked
+          STOLEN</td>
+      <td>To identify the person using the device and support a police
+          report.</td>
+    </tr>
+    <tr>
+      <td><b>Emergency contacts</b></td>
+      <td>Names, emails, phone numbers you add for people to notify when a
+          device is marked stolen</td>
+      <td>So we can email them the recovery report if you ask.</td>
+    </tr>
+    <tr>
+      <td><b>Technical logs</b></td>
+      <td>Heartbeat timestamps, command history, error messages, agent and
+          app version</td>
+      <td>To diagnose problems and improve reliability.</td>
+    </tr>
+  </table>
+
+  <div class="callout">
+    <b>We DO NOT:</b>
+    <ul>
+      <li>Capture webcam photos or screenshots without an explicit command
+          or without the device being marked STOLEN by you.</li>
+      <li>Record audio.</li>
+      <li>Log your keystrokes.</li>
+      <li>Read the contents of your personal files.</li>
+      <li>Sell your data to anyone.</li>
+      <li>Use your data for advertising or profiling.</li>
+    </ul>
+  </div>
+
+  <h2>3. Where your data is stored</h2>
+  <p>Your account record, device metadata, heartbeat log, command history,
+  location points, and emergency contacts are stored in a PostgreSQL
+  database hosted by our cloud-infrastructure provider. Webcam photos and
+  screenshots are stored in a dedicated image-hosting provider. All
+  providers are reputable third parties under contractual obligations
+  to protect data. Specific provider names are listed in the
+  <a href="/subprocessors">Sub-processor list</a> and may change as we
+  evolve the service; the categories of data we store remain as described
+  above.</p>
+
+  <h2>4. Who can see your data</h2>
+  <h3>You</h3>
+  <p>You can see all of your own data inside the mobile app or by
+  downloading a recovery report.</p>
+  <h3>Emergency contacts you have added</h3>
+  <p>When you mark a device STOLEN, each emergency contact with an email
+  on file receives the current recovery report (one email per
+  mark-stolen event). They do not get continuing access.</p>
+  <h3>PhantomTrace operator</h3>
+  <p>The operator (Francis Murungi) has administrative access to the
+  database for the purpose of maintaining the service and responding to
+  support requests. The operator will not access the contents of
+  individual accounts (including evidence images) unless you ask for
+  support that requires it, or unless legally compelled.</p>
+  <h3>Infrastructure providers</h3>
+  <p>Our hosting, database, image-storage, SMS, email, and push-notification
+  providers process your data only as needed to deliver the service.
+  They are bound by contract and by their own privacy practices. See
+  the sub-processor list for the current providers.</p>
+  <h3>Law enforcement</h3>
+  <p>We disclose data to law enforcement only in response to a valid
+  legal process issued under Ugandan law. We will notify you unless
+  the order prohibits notice.</p>
+
+  <h2>5. How long we keep your data</h2>
+  <ul>
+    <li><b>Account data</b> — for as long as your account exists.</li>
+    <li><b>Device heartbeats, command history, location points</b> — for 180
+        days, then deleted automatically.</li>
+    <li><b>Evidence (photos, screenshots)</b> — for 90 days from capture,
+        then deleted automatically. You can delete individual items sooner
+        from the Evidence screen.</li>
+    <li><b>Recovery reports</b> — generated on demand, not stored
+        server-side.</li>
+    <li><b>Account deletion</b> — within 30 days of your request, all of
+        your personal data is removed from our active systems; backup
+        copies are purged within an additional 60 days.</li>
+  </ul>
+
+  <h2>6. Security</h2>
+  <p>We use industry-standard protections:</p>
+  <ul>
+    <li>Passwords are stored as salted bcrypt hashes, never plain text.</li>
+    <li>All network traffic between the app, the agent, and the server uses
+        HTTPS with TLS 1.2 or higher.</li>
+    <li>Two-factor authentication (TOTP) and biometric sign-in are available
+        on the mobile app.</li>
+    <li>Devices marked STOLEN trigger automatic USB-storage lockdown and
+        BitLocker enforcement where supported.</li>
+  </ul>
+  <p>No system is perfectly secure. If we detect a breach that affects your
+  personal data, we will notify you by email within 72 hours and advise
+  on steps to protect yourself.</p>
+
+  <h2>7. Your rights</h2>
+  <p>Under Uganda's Data Protection and Privacy Act, 2019, you have the
+  right to:</p>
+  <ul>
+    <li>Access the personal data we hold about you (download via the app)</li>
+    <li>Correct inaccurate data (edit via the Settings screen)</li>
+    <li>Delete your account and all associated data</li>
+    <li>Object to processing you believe is unlawful</li>
+    <li>Lodge a complaint with the Personal Data Protection Office of
+        Uganda (<a href="https://pdpo.go.ug/">pdpo.go.ug</a>)</li>
+  </ul>
+  <p>To exercise these rights, use the controls in the app or email
+  <a href="mailto:mywatchhhh@gmail.com">mywatchhhh@gmail.com</a>.</p>
+
+  <h2>8. Children</h2>
+  <p>PhantomTrace is not directed at children under 13. If you are a
+  parent or guardian and believe your child under 13 has signed up for
+  the service, contact us and we will delete the account.</p>
+
+  <h2>9. International transfers</h2>
+  <p>Our infrastructure providers may store or process your data outside
+  Uganda, including in Europe or North America. We only use providers
+  that commit to protection standards comparable to those required by
+  Ugandan law.</p>
+
+  <h2>10. Changes to this Policy</h2>
+  <p>We may update this Privacy Policy from time to time. If we make
+  material changes we will notify you in the app and by email at least
+  14 days before the changes take effect.</p>
+
+  <div class="divider"></div>
+  <p class="footer">© 2026 PhantomTrace &middot;
+  <a href="/terms">Terms of Service</a> &middot;
+  <a href="mailto:mywatchhhh@gmail.com">Contact</a></p>
+</div>
+</body>
+</html>

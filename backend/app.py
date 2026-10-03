@@ -140,6 +140,11 @@ class User(db.Model):
     totp_recovery_codes = db.Column(db.Text)   # comma-separated, one-use each
     # Tracks when the password was last reset. Used to invalidate old JWTs.
     password_reset_at = db.Column(db.DateTime)
+    # When the user agreed to the Terms of Service + Privacy Policy. Required
+    # at signup from v1.1 onward; existing accounts are grandfathered in on
+    # their next login (we'll back-fill a timestamp then).
+    legal_accepted_at = db.Column(db.DateTime)
+    legal_version     = db.Column(db.String(20))   # which version they accepted
 
 
 # Password reset OTP — sent via SMS to the phone registered with the account.
@@ -367,6 +372,41 @@ def notify_device_owner(device_id, title, body, data=None):
         print(f"notify error: {e}")
 
 
+# ── Public legal pages ─────────────────────────────────────────────────────
+# Served as static HTML so Google Play Store and users can link to them
+# publicly. The actual text lives in backend/legal/*.html so updates are
+# just git-pushes without touching Python.
+import pathlib as _pathlib
+_LEGAL_DIR = _pathlib.Path(__file__).parent / 'legal'
+
+@app.route('/terms', methods=['GET'])
+@app.route('/tos',   methods=['GET'])     # friendly alias
+def legal_terms():
+    try:
+        return send_file(_LEGAL_DIR / 'terms.html', mimetype='text/html')
+    except Exception:
+        return "Terms of Service not available", 500
+
+@app.route('/privacy', methods=['GET'])
+@app.route('/privacy-policy', methods=['GET'])
+def legal_privacy():
+    try:
+        return send_file(_LEGAL_DIR / 'privacy.html', mimetype='text/html')
+    except Exception:
+        return "Privacy Policy not available", 500
+
+@app.route('/', methods=['GET'])
+def legal_root():
+    # Friendly landing for anyone who types the backend URL in a browser.
+    return ('<html><body style="background:#0A0A0A;color:#F3F4F6;'
+            'font-family:system-ui;padding:48px;text-align:center">'
+            '<h1>PhantomTrace</h1>'
+            '<p>Anti-theft and recovery platform for Windows laptops.</p>'
+            '<p><a style="color:#DC2626" href="/terms">Terms of Service</a> &middot; '
+            '<a style="color:#DC2626" href="/privacy">Privacy Policy</a></p>'
+            '</body></html>')
+
+
 @app.route('/api/auth/fcm-token', methods=['POST'])
 @jwt_required()
 def save_fcm_token():
@@ -382,15 +422,29 @@ def save_fcm_token():
     db.session.commit()
     return jsonify({"message": "FCM token saved"}), 200
 
+LEGAL_VERSION = '2026-10-03'   # bump when the Terms/Privacy text materially changes
+
 @app.route('/api/auth/register', methods=['POST'])
 def register():
     data = request.get_json()
     if not data or not all(k in data for k in ['name','email','phone','password']):
         return jsonify({'error': 'Missing required fields'}), 400
+    # Legal: block signup if the user hasn't accepted Terms + Privacy. The
+    # mobile app shows a required checkbox; this is defense-in-depth so a
+    # custom client cannot bypass it.
+    if not data.get('accepted_terms'):
+        return jsonify({'error':
+            'You must accept the Terms of Service and Privacy Policy to '
+            'create an account.'}), 400
     if User.query.filter_by(email=data['email']).first():
         return jsonify({'error': 'Email already registered'}), 409
     password_hash = bcrypt.hashpw(data['password'].encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-    user = User(name=data['name'], email=data['email'], phone=data['phone'], password_hash=password_hash)
+    user = User(
+        name=data['name'], email=data['email'], phone=data['phone'],
+        password_hash=password_hash,
+        legal_accepted_at=datetime.utcnow(),
+        legal_version=LEGAL_VERSION,
+    )
     db.session.add(user)
     db.session.commit()
     token = create_access_token(identity=user.id)
@@ -861,8 +915,17 @@ def list_devices():
     return jsonify({'devices': result}), 200
 
 
-# Delete a device — owner-only, irreversible. Cascades to related records
-# so the DB doesn't leak orphans.
+# Delete a device — owner-only.
+#
+# Two-phase so the laptop isn't orphaned with a running agent:
+#   1. Default (?mode=graceful): queue AGENT_UNINSTALL + mark the device as
+#      pending delete. The agent, on its next poll, sees the command, tears
+#      itself down (persistence, device.json, exe) and acknowledges. Only
+#      THEN do we delete the DB rows. The mobile shows "pending" state in
+#      the meantime.
+#   2. mode=force: delete DB rows immediately. Use this if the laptop is
+#      offline/lost and will never come back. Any still-running agent
+#      becomes a dead-letter.
 @app.route('/api/device/<device_id>', methods=['DELETE'])
 @jwt_required()
 def delete_device(device_id):
@@ -870,9 +933,34 @@ def delete_device(device_id):
     if not device:
         return jsonify({'error': 'Device not found'}), 404
     device_name = device.device_name
-    # Clean up related rows first (order matters — FK constraints).
+    mode = (request.args.get('mode') or 'force').lower()
+
+    # Always queue the uninstall so the agent can self-destruct if it ever
+    # comes online again, even in force mode.
+    try:
+        db.session.add(Command(device_id=device_id, command_type='AGENT_UNINSTALL'))
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        print(f"delete_device: queue AGENT_UNINSTALL: {e}")
+
+    if mode == 'graceful':
+        # Leave the device + its data in place for 24h so the agent has a
+        # window to pick up the uninstall command. The mobile hides the
+        # device until the backing row is actually deleted; the client can
+        # tap "force delete" to skip this wait.
+        return jsonify({
+            'message': f'Uninstall command sent to "{device_name}". '
+                       'The agent will clean itself up on its next check-in '
+                       '(up to a few seconds while online, longer if offline).',
+            'phase': 'uninstall_queued',
+        }), 202
+
+    # Force / immediate: cascade clean-up now.
     for tbl in ('commands', 'command_history', 'evidence_photos',
-                'sightings', 'location_history', 'device_location'):
+                'sightings', 'location_history', 'device_location',
+                'device_system_info', 'device_network_info',
+                'device_disk_info', 'device_processes'):
         try:
             db.session.execute(
                 db.text(f"DELETE FROM {tbl} WHERE device_id = :did"),
@@ -883,6 +971,23 @@ def delete_device(device_id):
     db.session.delete(device)
     db.session.commit()
     return jsonify({'message': f'"{device_name}" deleted'}), 200
+
+
+# Rename a device from the mobile app. Device name is cosmetic — doesn't
+# affect pairing, beacon, or identity.
+@app.route('/api/device/<device_id>/rename', methods=['POST'])
+@jwt_required()
+def rename_device(device_id):
+    device = Device.query.filter_by(id=device_id, user_id=get_jwt_identity()).first()
+    if not device:
+        return jsonify({'error': 'Device not found'}), 404
+    data = request.get_json() or {}
+    name = (data.get('name') or '').strip()
+    if not name:
+        return jsonify({'error': 'Name cannot be empty'}), 400
+    device.device_name = name[:100]
+    db.session.commit()
+    return jsonify({'message': 'Device renamed', 'device_name': device.device_name}), 200
 
 
 # ── BIOS protection reporting ─────────────────────────────────────────────
@@ -948,6 +1053,141 @@ def set_bios_protected(device_id):
     db.session.commit()
     return jsonify({'message': 'BIOS protection status updated',
                     'protected': protected}), 200
+
+
+# ── Account management: profile, password change, deletion ────────────────
+@app.route('/api/user/me', methods=['GET'])
+@jwt_required()
+def get_me():
+    """Returns the current user's profile for the Settings screen."""
+    uid = get_jwt_identity()
+    user = User.query.filter_by(id=uid).first()
+    if not user:
+        return jsonify({'error': 'Not found'}), 404
+    device_count = Device.query.filter_by(user_id=uid).count()
+    return jsonify({
+        'id': user.id,
+        'name': user.name,
+        'email': user.email,
+        'phone': user.phone,
+        'totp_enabled': bool(user.totp_enabled),
+        'legal_accepted_at': user.legal_accepted_at.isoformat() if user.legal_accepted_at else None,
+        'created_at': user.created_at.isoformat() if user.created_at else None,
+        'device_count': device_count,
+    }), 200
+
+
+@app.route('/api/user/update-profile', methods=['POST'])
+@jwt_required()
+def update_profile():
+    """Updates the editable fields on the user profile: name + phone.
+    Email changes are deliberately NOT allowed here — email is the primary
+    identity + the password-reset channel, so changing it needs a dedicated
+    verification flow we have not built yet."""
+    uid = get_jwt_identity()
+    user = User.query.filter_by(id=uid).first()
+    if not user:
+        return jsonify({'error': 'Not found'}), 404
+    data = request.get_json() or {}
+    name = (data.get('name') or '').strip()
+    phone = (data.get('phone') or '').strip()
+    if name:
+        user.name = name[:100]
+    if phone:
+        user.phone = phone[:20]
+    db.session.commit()
+    return jsonify({'message': 'Profile updated',
+                    'name': user.name, 'phone': user.phone}), 200
+
+
+@app.route('/api/user/change-password', methods=['POST'])
+@jwt_required()
+def change_password():
+    """Requires current password + new password. On success, the user's
+    existing tokens continue to work (they're already authenticated); the
+    stored hash just changes."""
+    uid = get_jwt_identity()
+    user = User.query.filter_by(id=uid).first()
+    if not user:
+        return jsonify({'error': 'Not found'}), 404
+    data = request.get_json() or {}
+    current = data.get('current_password') or ''
+    new_pass = data.get('new_password') or ''
+    if not current or not new_pass:
+        return jsonify({'error': 'Both current and new passwords are required'}), 400
+    if len(new_pass) < 8:
+        return jsonify({'error': 'New password must be at least 8 characters long'}), 400
+    if not bcrypt.checkpw(current.encode('utf-8'),
+                          user.password_hash.encode('utf-8')):
+        return jsonify({'error': 'Your current password is incorrect'}), 403
+    user.password_hash = bcrypt.hashpw(
+        new_pass.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+    user.password_reset_at = datetime.utcnow()
+    db.session.commit()
+    return jsonify({'message': 'Password changed'}), 200
+
+
+@app.route('/api/user/account', methods=['DELETE'])
+@jwt_required()
+def delete_account():
+    """Hard-deletes the user account AND all their devices + related rows.
+    Danger zone: typed email confirmation enforced here. Agents on paired
+    devices will stop seeing valid heartbeats and self-stop after a few
+    offline-lock cycles."""
+    uid = get_jwt_identity()
+    user = User.query.filter_by(id=uid).first()
+    if not user:
+        return jsonify({'error': 'Not found'}), 404
+    data = request.get_json() or {}
+    confirm = (data.get('confirm_email') or '').strip().lower()
+    if confirm != (user.email or '').lower():
+        return jsonify({'error':
+            'Please type your email address exactly to confirm the deletion.'}), 400
+    try:
+        # Cascade clean-up. SQL foreign keys would do this for us but we
+        # delete explicitly so the order is deterministic in SQLite dev mode.
+        devices = Device.query.filter_by(user_id=user.id).all()
+        for d in devices:
+            # Queue a self-destruct for the agent on each device, in case
+            # one of them is still online and able to receive it.
+            try:
+                db.session.add(Command(device_id=d.id, command_type='AGENT_UNINSTALL'))
+            except Exception:
+                pass
+        db.session.commit()
+        for d in devices:
+            Command.query.filter_by(device_id=d.id).delete()
+            EvidencePhoto.query.filter_by(device_id=d.id).delete()
+            try: EvidenceKeylog.query.filter_by(device_id=d.id).delete()
+            except Exception: pass
+            try: DeviceLocation.query.filter_by(device_id=d.id).delete()
+            except Exception: pass
+            try: DeviceSystemInfo.query.filter_by(device_id=d.id).delete()
+            except Exception: pass
+            try: DeviceNetworkInfo.query.filter_by(device_id=d.id).delete()
+            except Exception: pass
+            try: DeviceDiskInfo.query.filter_by(device_id=d.id).delete()
+            except Exception: pass
+            try: DeviceProcess.query.filter_by(device_id=d.id).delete()
+            except Exception: pass
+            try: LocationHistory.query.filter_by(device_id=d.id).delete()
+            except Exception: pass
+            try: Sighting.query.filter_by(device_id=d.id).delete()
+            except Exception: pass
+            try: CommandHistory.query.filter_by(device_id=d.id).delete()
+            except Exception: pass
+            db.session.delete(d)
+        EmergencyContact.query.filter_by(user_id=user.id).delete()
+        try: PasswordResetOtp.query.filter_by(user_id=user.id).delete()
+        except Exception: pass
+        try: QuickLockOtp.query.filter_by(user_id=user.id).delete()
+        except Exception: pass
+        db.session.delete(user)
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': f'Deletion failed: {e}'}), 500
+    return jsonify({'message': 'Account deleted'}), 200
 
 
 # ── Emergency contacts: CRUD endpoints ────────────────────────────────────
@@ -2175,6 +2415,7 @@ _ALLOWED_COMMANDS = {
     'DETERRENT_LOCK','UNLOCK_DETERRENT',                        # T4
     'BITLOCKER_STATUS','ENABLE_BITLOCKER','INSTANT_WIPE',       # T8
     'USB_LOCKDOWN','USB_UNLOCKDOWN',                            # Layer A
+    'AGENT_UNINSTALL',                                           # v1 self-destruct
 }
 
 @app.route('/api/command/send', methods=['POST'])

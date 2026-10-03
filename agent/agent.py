@@ -101,6 +101,14 @@ except Exception as _bwe:
     _HAS_BIOS_WIZARD = False
     print(f"BIOS wizard module unavailable: {_bwe}")
 
+# Self-destruct: owner deleted the device → agent uninstalls itself.
+try:
+    import self_destruct
+    _HAS_SELF_DESTRUCT = True
+except Exception as _sde:
+    _HAS_SELF_DESTRUCT = False
+    print(f"Self-destruct module unavailable: {_sde}")
+
 if getattr(sys, 'frozen', False):
     CONFIG_FILE = os.path.join(os.path.dirname(sys.executable), 'device.json')
 else:
@@ -1526,6 +1534,32 @@ while True:
                         usb_lockdown.unlock_usb_storage()
                     else:
                         print("USB lockdown module unavailable")
+
+                elif ctype == "AGENT_UNINSTALL":
+                    # Owner deleted this device from the mobile app.
+                    # Acknowledge the command FIRST (so the backend knows
+                    # we received it and can delete the DB row), then
+                    # tear down persistence + delete our files + exit.
+                    print("AGENT_UNINSTALL received — acknowledging then self-destructing")
+                    try:
+                        requests.post(f"{BASE_URL}/api/command/acknowledge/{cid}", timeout=6)
+                        requests.post(f"{BASE_URL}/api/command/result",
+                            json={"device_id": DEVICE_ID,
+                                  "command_type": ctype,
+                                  "result": "SUCCESS"},
+                            timeout=6)
+                    except Exception as _ack_err:
+                        print(f"AGENT_UNINSTALL ack failed (continuing anyway): {_ack_err}")
+                    if _HAS_SELF_DESTRUCT:
+                        self_destruct.perform_self_destruct()
+                    # Fallback: at least raise the stop flag so the
+                    # watchdog doesn't resurrect us.
+                    try:
+                        if _HAS_PERSISTENCE:
+                            with open(persistence.STOP_FLAG, "w") as _f:
+                                _f.write("stop")
+                    except Exception: pass
+                    sys.exit(0)
 
                 # Acknowledge command
                 requests.post(f"{BASE_URL}/api/command/acknowledge/{cid}", timeout=8)
