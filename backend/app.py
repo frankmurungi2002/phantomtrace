@@ -2662,6 +2662,11 @@ def device_overview(device_id):
         if device.last_seen:
             online = (datetime.utcnow() - device.last_seen).total_seconds() < 30
     return jsonify({
+        # Return status so the mobile UI stays in sync. Without this,
+        # the "Mark as Stolen" button stayed stuck even after flipping
+        # the status — the mobile only had widget.initialStatus to go on.
+        "status": device.status if device else "SAFE",
+        "stolen_at": device.stolen_at.isoformat() if device and device.stolen_at else None,
         "online": online,
         "last_seen": last_seen,
         "system_info": dict(system_info) if system_info else None,

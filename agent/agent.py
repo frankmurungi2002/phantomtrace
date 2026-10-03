@@ -953,18 +953,57 @@ def lock_device():
 #   4. Re-asserts max volume every 2 seconds — if the thief frantically grabs
 #      the volume slider, it snaps back up within 2s.
 def _force_max_volume_windows():
-    """Set master volume to 100% and unmute. Hardware level, bypasses UI."""
+    """Set master volume to 100% and unmute AT THE HARDWARE LEVEL,
+    AND set every per-app audio session to 100% + unmuted. Windows gives
+    each app its own volume slider in the Volume Mixer; if ours happens
+    to be 10%, the siren plays at 10% even if master is 100%. We iterate
+    over every ISimpleAudioVolume session and crank them all up.
+    """
     try:
         from ctypes import cast, POINTER
         from comtypes import CLSCTX_ALL
-        from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+        from pycaw.pycaw import (AudioUtilities, IAudioEndpointVolume,
+                                 ISimpleAudioVolume)
+        # 1) Master volume + unmute.
         devices = AudioUtilities.GetSpeakers()
         interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
         volume = cast(interface, POINTER(IAudioEndpointVolume))
         volume.SetMute(0, None)
         volume.SetMasterVolumeLevelScalar(1.0, None)
+        # 2) Every per-app audio session — crank them all up + unmute.
+        for session in AudioUtilities.GetAllSessions():
+            try:
+                sv = session._ctl.QueryInterface(ISimpleAudioVolume)
+                sv.SetMute(0, None)
+                sv.SetMasterVolume(1.0, None)
+            except Exception:
+                pass
     except Exception as e:
         print(f"Volume force failed: {e}")
+
+
+def _speak_alarm_async():
+    """Overlay a loud voice saying 'ALARM. STOLEN DEVICE. ALARM. STOP.' on
+    top of the siren. SAPI uses a separate audio pipe so it adds to the
+    perceived loudness without stepping on the siren. Runs in a daemon
+    thread; stops when _alarm_active goes False."""
+    def _loop():
+        try:
+            import comtypes.client
+            # SAPI.SpVoice is the Windows text-to-speech engine. We set
+            # Volume=100 and Rate=0 (normal) and loop short bursts so we
+            # can bail out quickly when the owner hits STOP_ALARM.
+            voice = comtypes.client.CreateObject("SAPI.SpVoice")
+            voice.Volume = 100
+            voice.Rate   = 0
+            while _alarm_active:
+                voice.Speak(
+                    "ALARM. STOLEN DEVICE. ALARM. STOLEN DEVICE.",
+                    0,  # SVSFDefault — synchronous, blocks until done
+                )
+        except Exception as e:
+            print(f"SAPI alarm overlay failed: {e}")
+    threading.Thread(target=_loop, daemon=True).start()
 
 def _synthesize_siren_wav(path, duration_seconds=6):
     """Write a looping two-tone siren WAV to `path`. 22.05 kHz, 16-bit mono.
@@ -1019,10 +1058,15 @@ def trigger_alarm(device_id):
             # we call PlaySound(None, SND_PURGE) in stop_alarm().
             winsound.PlaySound(siren_path,
                                winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_LOOP)
+            # SAPI "ALARM STOLEN DEVICE" voice overlay — rides on a separate
+            # audio channel, so perceived loudness doubles AND it tells
+            # anyone nearby exactly what's happening.
+            _speak_alarm_async()
 
-            # Re-assert volume every 2s in case the thief tries to mute.
+            # Re-assert volume every 1.5s in case the thief tries to mute.
+            # Shorter cadence than before (was 2s) — snaps back faster.
             while _alarm_active:
-                time.sleep(2)
+                time.sleep(1.5)
                 _force_max_volume_windows()
         except Exception as e:
             print(f"Alarm (win) error: {e}")
